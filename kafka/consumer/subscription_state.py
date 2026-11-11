@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Sequence
 from enum import IntEnum
+import heapq
 import logging
 import random
 import re
@@ -21,6 +22,100 @@ class SubscriptionType(IntEnum):
     AUTO_TOPICS = 1
     AUTO_PATTERN = 2
     USER_ASSIGNED = 3
+
+
+class PartitionCompletionTracker:
+    """Tracks record delivery vs. processing completion for one partition
+    under explicit commit mode.
+
+    A partition's fetch position advances the moment records are handed to
+    the user (or fetched into its buffer), so committing that position
+    directly would skip records that are still being processed. The tracker
+    keeps the two notions apart:
+
+    * :meth:`register_delivery` records every offset that was actually
+      delivered to the user. Delivery ranges need not be contiguous:
+      compacted logs and control records can leave gaps that will never be
+      filled, so the watermark advances over gaps instead of waiting for an
+      offset that does not exist.
+    * :meth:`mark_processed` records an offset whose user-side processing
+      (e.g. the database write) has finished. Duplicate notifications are
+      harmless.
+    * :meth:`committable_position` is the next offset safe to commit: one
+      past the highest offset in the processed prefix of the actually
+      delivered offsets, stopping at the first delivered offset that is not
+      yet processed.
+
+    A :meth:`seek` drops all tracking state: pre-seek delivery/completion
+    notifications no longer describe the position the consumer will read
+    from, and keeping them could advance the watermark past records the
+    seek is about to re-deliver.
+
+    This only tracks what has been processed *within this consumer*.
+    Committing the resulting position to Kafka does not make the database
+    write and the offset commit atomic - this mode is not cross-system
+    exactly-once.
+    """
+
+    def __init__(self):
+        # Offsets that have been delivered to the user but not yet
+        # accounted for in the processed prefix. A min-heap keeps removal
+        # cheap when completions arrive out of order.
+        self._unprocessed = []
+        self._unprocessed_set = set()
+        # Highest offset whose completion has already advanced the watermark.
+        self._last_processed_offset = None
+
+    def register_delivery(self, offset):
+        """Record that the record at ``offset`` has been delivered to the
+        user. Safe to call more than once for the same offset."""
+        if offset not in self._unprocessed_set:
+            heapq.heappush(self._unprocessed, offset)
+            self._unprocessed_set.add(offset)
+
+    def mark_processed(self, offset):
+        """Record that processing of the record at ``offset`` has finished.
+
+        Returns True if this is the first completion notice for ``offset``,
+        False for a duplicate. Completing an offset that was never delivered
+        (or belongs to a pre-seek generation) is ignored and returns False.
+        """
+        if offset not in self._unprocessed_set:
+            return False
+        self._unprocessed_set.discard(offset)
+        # Repeated duplicate notices can leave stale entries in the heap;
+        # they are filtered lazily while advancing the watermark instead of
+        # paying for an O(n) removal here.
+        if self._last_processed_offset is None or offset > self._last_processed_offset:
+            self._last_processed_offset = offset
+        return True
+
+    def committable_position(self):
+        """Return the next offset safe to commit, or None if nothing is
+        processable yet.
+
+        The watermark walks the delivered offsets in order, skipping gaps
+        (offsets never delivered cannot be processed and must not block the
+        commit), and stops at the first delivered-but-unprocessed offset.
+        """
+        while self._unprocessed and self._unprocessed[0] not in self._unprocessed_set:
+            heapq.heappop(self._unprocessed)
+        if self._last_processed_offset is None:
+            return None
+        if self._unprocessed:
+            next_unprocessed = self._unprocessed[0]
+            if next_unprocessed <= self._last_processed_offset:
+                # The smallest outstanding delivery is not done, so the
+                # processed prefix ends just before it even if a later
+                # offset has already completed.
+                return next_unprocessed
+        return self._last_processed_offset + 1
+
+    def reset(self):
+        """Forget all delivery/completion state (after a seek)."""
+        self._unprocessed = []
+        self._unprocessed_set = set()
+        self._last_processed_offset = None
 
 
 class SubscriptionState:
@@ -49,13 +144,18 @@ class SubscriptionState:
         " (2) subscribe to topics matching a regex pattern,"
         " (3) assign itself specific topic-partitions.")
 
-    def __init__(self, offset_reset_strategy='earliest'):
+    def __init__(self, offset_reset_strategy='earliest', explicit_commit_mode=False):
         """Initialize a SubscriptionState instance
 
         Keyword Arguments:
             offset_reset_strategy: 'earliest' or 'latest', otherwise
                 exception will be raised when fetching an offset that is no
                 longer available. Default: 'earliest'
+            explicit_commit_mode (bool): when True, per-partition delivery and
+                processing-completion state is maintained so commits advance
+                only to offsets whose records have been processed. Defaults
+                to False, in which case commits use the fetch position
+                directly (the legacy behaviour).
         """
         try:
             offset_reset_strategy = getattr(OffsetResetStrategy,
@@ -74,6 +174,13 @@ class SubscriptionState:
         self.rebalance_listener = None
         self.listeners = []
         self._lock = threading.RLock()
+        self.explicit_commit_mode = explicit_commit_mode
+        # TopicPartition -> PartitionCompletionTracker. An entry exists only
+        # while the partition is assigned, so a completion notice from an old
+        # generation can never mutate a freshly (re)assigned partition's
+        # state: _apply_assignment drops revoked entries and creates empty
+        # ones for new partitions.
+        self._completion_trackers = {}
 
     def _set_subscription_type(self, subscription_type):
         if not isinstance(subscription_type, SubscriptionType):
@@ -290,6 +397,10 @@ class SubscriptionState:
         for tp in list(self.assignment.keys()):
             if tp not in new_set:
                 del self.assignment[tp]
+                # Completion notices from the revoked generation must not
+                # advance the state of a later re-assignment, so the tracker
+                # goes away with the partition.
+                self._completion_trackers.pop(tp, None)
             else:
                 # Retained partitions are no longer pending_revocation
                 self.assignment[tp].mark_pending_revocation(False)
@@ -301,6 +412,7 @@ class SubscriptionState:
             random.shuffle(new_partitions)
         for tp in new_partitions:
             self.assignment[tp] = TopicPartitionState()
+            self._completion_trackers[tp] = PartitionCompletionTracker()
 
     @synchronized
     def unsubscribe(self):
@@ -308,6 +420,7 @@ class SubscriptionState:
         self.subscription = None
         self._user_assignment.clear()
         self.assignment.clear()
+        self._completion_trackers.clear()
         self.subscribed_pattern = None
         self.subscription_type = SubscriptionType.NONE
 
@@ -344,6 +457,13 @@ class SubscriptionState:
         if not isinstance(offset, (int, OffsetAndMetadata)):
             raise TypeError("offset must be type in or OffsetAndMetadata")
         self.assignment[partition].seek(offset)
+        # A seek discards the fetch position the in-flight deliveries were
+        # relative to: previously delivered/processed offsets no longer
+        # describe what will be re-read, and keeping them could let a stale
+        # completion advance the watermark past freshly re-delivered records.
+        tracker = self._completion_trackers.get(partition)
+        if tracker is not None:
+            tracker.reset()
 
     @synchronized
     def assigned_partitions(self):
@@ -378,6 +498,57 @@ class SubscriptionState:
             if state.has_valid_position:
                 all_consumed[partition] = state.position
         return all_consumed
+
+    def register_delivery(self, partition, offset):
+        """Record that the record at ``offset`` on ``partition`` has been
+        delivered to the user. Only meaningful in explicit commit mode;
+        a no-op otherwise and for partitions no longer assigned.
+        """
+        if not self.explicit_commit_mode:
+            return
+        tracker = self._completion_trackers.get(partition)
+        if tracker is None:
+            return
+        with self._lock:
+            tracker.register_delivery(offset)
+
+    def mark_processed(self, partition, offset):
+        """Record that user-side processing of the record at ``offset`` has
+        completed.
+
+        Returns True if the notice advanced this partition's tracking, False
+        for a duplicate, for an offset that was never delivered, after a
+        seek, or for a partition the consumer no longer owns - stale
+        notifications from an old assignment cannot affect the current one.
+        """
+        tracker = self._completion_trackers.get(partition)
+        if tracker is None:
+            return False
+        with self._lock:
+            return tracker.mark_processed(offset)
+
+    @synchronized
+    def all_committable_offsets(self):
+        """Per-partition next offsets safe to commit in explicit commit mode.
+
+        Returns {TopicPartition: OffsetAndMetadata} containing only
+        partitions with a non-None processed watermark. Offsets are computed
+        from actual delivery ranges, so gaps (compacted log, control
+        records) do not stall the commit. The leader epoch follows the
+        partition's current fetch position, matching
+        :meth:`all_consumed_offsets`.
+        """
+        if not self.explicit_commit_mode:
+            return self.all_consumed_offsets()
+        committable = {}
+        for partition, tracker in self._completion_trackers.items():
+            position = tracker.committable_position()
+            if position is None:
+                continue
+            state = self.assignment[partition]
+            leader_epoch = state.position.leader_epoch if state.has_valid_position else -1
+            committable[partition] = OffsetAndMetadata(position, '', leader_epoch)
+        return committable
 
     @synchronized
     def request_offset_reset(self, partition, offset_reset_strategy=None):

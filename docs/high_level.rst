@@ -37,6 +37,21 @@ KafkaConsumer
             tp: OffsetAndMetadata(message.offset + 1, '', -1)
         })
     
+    # Explicit processing-completion commits: when records are processed in
+    # parallel, the fetch position must not be committed directly. With
+    # explicit_commit_mode=True the consumer tracks which delivered records
+    # have been marked processed and commits only the contiguous processed
+    # prefix per partition (gaps from log compaction or control records do
+    # not block it). This narrows the window in which a commit overtakes
+    # unfinished processing; it is not cross-system exactly-once.
+    consumer = KafkaConsumer('my-topic',
+                             group_id='my-group',
+                             explicit_commit_mode=True,
+                             bootstrap_servers=['localhost:9092'])
+    for message in consumer:
+        process_message(message)          # e.g. write to a database
+        consumer.mark_processed(message)  # then the next commit can advance
+
     # consume earliest available messages, don't commit offsets
     KafkaConsumer(auto_offset_reset='earliest', enable_auto_commit=False)
 

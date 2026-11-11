@@ -144,6 +144,17 @@ class KafkaConsumer:
             periodically committed in the background. Default: True.
         auto_commit_interval_ms (int): Number of milliseconds between automatic
             offset commits, if enable_auto_commit is True. Default: 5000.
+        explicit_commit_mode (bool): If True, offsets are committed based on
+            records the application has explicitly marked processed via
+            :meth:`mark_processed`, instead of the fetch position. Per
+            partition, the commit advances over the actually delivered offset
+            range - gaps from log compaction or control records do not block
+            it - but never past an unprocessed record. Seeks drop in-flight
+            tracking and partition revocation/reassignment isolates stale
+            completion notices. This narrows the window in which a commit
+            overtakes unfinished processing; it does not make the database
+            write and the offset commit atomic, so it is not cross-system
+            exactly-once. Default: False.
         default_offset_commit_callback (callable): Called as
             callback(offsets, response) response will be either an Exception
             or an OffsetCommitResponse struct. This callback can be used to
@@ -345,6 +356,7 @@ class KafkaConsumer:
         'enable_auto_commit': True,
         'auto_commit_interval_ms': 5000,
         'default_offset_commit_callback': lambda offsets, response: True,
+        'explicit_commit_mode': False,
         'check_crcs': True,
         'isolation_level': 'read_uncommitted',
         'allow_auto_create_topics': True,
@@ -492,7 +504,9 @@ class KafkaConsumer:
             if self.config['group_id'] is None:
                 raise KafkaConfigurationError("group_instance_id requires group_id")
 
-        self._subscription = SubscriptionState(self.config['auto_offset_reset'])
+        self._subscription = SubscriptionState(
+            self.config['auto_offset_reset'],
+            explicit_commit_mode=self.config['explicit_commit_mode'])
         self._fetcher = Fetcher(
             self._client, self._subscription, metrics=self._metrics, **self.config)
         self._coordinator = ConsumerCoordinator(
@@ -676,7 +690,7 @@ class KafkaConsumer:
         if self.config['group_id'] is None:
             raise Errors.IllegalStateError('Requires group_id')
         if offsets is None:
-            offsets = self._subscription.all_consumed_offsets()
+            offsets = self._offsets_to_commit()
         log.debug("Committing offsets: %s", offsets)
         future = self._coordinator.commit_offsets_async(
             offsets, callback=callback)
@@ -717,8 +731,46 @@ class KafkaConsumer:
         if self.config['group_id'] is None:
             raise Errors.IllegalStateError('Requires group_id')
         if offsets is None:
-            offsets = self._subscription.all_consumed_offsets()
+            offsets = self._offsets_to_commit()
         self._coordinator.commit_offsets_sync(offsets, timeout_ms=timeout_ms)
+
+    def _offsets_to_commit(self):
+        """Offsets for a default commit. Explicit commit mode commits the
+        processed watermark rather than the fetch position."""
+        if self.config['explicit_commit_mode']:
+            return self._subscription.all_committable_offsets()
+        return self._subscription.all_consumed_offsets()
+
+    def mark_processed(self, message):
+        """Mark a delivered record as processed in explicit commit mode.
+
+        Records are processed in parallel, so the fetch position cannot be
+        committed directly: it may overtake records whose database writes
+        have not finished. Call this once the user-side work for ``message``
+        has completed; the next :meth:`commit` (sync or automatic) then
+        advances the partition's committed offset over the contiguous
+        processed prefix of the actually delivered records.
+
+        Completion notices may arrive in any order and may be repeated -
+        duplicates are ignored. A notice for a partition no longer assigned,
+        or for an offset superseded by a seek, is ignored and cannot affect
+        the current assignment's state.
+
+        Arguments:
+            message (ConsumerRecord): the record whose processing completed.
+
+        Returns:
+            bool: True if this notice was new, False if it was a duplicate
+            or otherwise ignored.
+
+        Note:
+            This only coordinates the committed Kafka offset with processing
+            inside this consumer. It does not make an external database
+            write and the offset commit atomic - the mode is not
+            cross-system exactly-once.
+        """
+        partition = TopicPartition(message.topic, message.partition)
+        return self._subscription.mark_processed(partition, message.offset)
 
     def group_metadata(self):
         """Return a snapshot of this consumer's group membership.
@@ -1076,7 +1128,9 @@ class KafkaConsumer:
         if partition not in self._subscription.assigned_partitions():
             raise ValueError('Unassigned partition')
         log.debug("Seeking to offset %s for partition %s", offset, partition)
-        self._subscription.assignment[partition].seek(offset)
+        # Route through SubscriptionState.seek so explicit-commit tracking
+        # state is reset along with the fetch position.
+        self._subscription.seek(partition, offset)
         self._iterator = None
 
     def seek_to_beginning(self, *partitions):

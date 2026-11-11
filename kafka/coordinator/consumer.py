@@ -32,6 +32,7 @@ class ConsumerCoordinator(BaseCoordinator):
         'enable_auto_commit': True,
         'auto_commit_interval_ms': 5000,
         'default_offset_commit_callback': None,
+        'explicit_commit_mode': False,
         'assignors': (RangePartitionAssignor, RoundRobinPartitionAssignor, StickyPartitionAssignor),
         'exclude_internal_topics': True,
         'isolation_level': 'read_uncommitted',
@@ -519,7 +520,7 @@ class ConsumerCoordinator(BaseCoordinator):
         if self.config['enable_auto_commit']:
             try:
                 await self._commit_offsets_sync_async(
-                    self._subscription.all_consumed_offsets(),
+                    self._offsets_to_commit(),
                     timeout_ms=timeout_ms)
             except (Errors.UnknownMemberIdError,
                     Errors.IllegalGenerationError,
@@ -871,7 +872,7 @@ class ConsumerCoordinator(BaseCoordinator):
     def _maybe_auto_commit_offsets_sync(self, timeout_ms=None):
         if self.config['enable_auto_commit']:
             try:
-                self.commit_offsets_sync(self._subscription.all_consumed_offsets(), timeout_ms=timeout_ms)
+                self.commit_offsets_sync(self._offsets_to_commit(), timeout_ms=timeout_ms)
 
             # The three main group membership errors are known and should not
             # require a stacktrace -- just a warning
@@ -1199,8 +1200,20 @@ class ConsumerCoordinator(BaseCoordinator):
             self._do_auto_commit_offsets_async()
 
     def _do_auto_commit_offsets_async(self):
-        self.commit_offsets_async(self._subscription.all_consumed_offsets(),
+        self.commit_offsets_async(self._offsets_to_commit(),
                                   self._commit_offsets_async_on_complete)
+
+    def _offsets_to_commit(self):
+        """Offsets that should be sent in the next commit.
+
+        In explicit commit mode this is the per-partition processed
+        watermark (records actually delivered and marked complete), never
+        the raw fetch position. Otherwise it is the current fetch position,
+        matching the legacy behaviour.
+        """
+        if self.config['explicit_commit_mode']:
+            return self._subscription.all_committable_offsets()
+        return self._subscription.all_consumed_offsets()
 
 
 class ConsumerCoordinatorMetrics:

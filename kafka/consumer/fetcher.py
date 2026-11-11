@@ -660,6 +660,13 @@ class Fetcher:
                 # we should avoid initializing the default list unless there are records
                 if part_records:
                     drained[tp].extend(part_records)
+                    # Explicit commit mode: these offsets are now in the user's
+                    # hands. Only records actually returned get registered, so
+                    # gaps left by compacted records or skipped control/aborted
+                    # batches don't wait for an offset that will never arrive.
+                    if self._subscriptions.explicit_commit_mode:
+                        for record in part_records:
+                            self._subscriptions.register_delivery(tp, record.offset)
                 # We want to increment subscription position if (1) we're using consumer.poll(),
                 # or (2) we didn't return any records (consumer iterator will update position
                 # when each message is yielded). There may be edge cases where we re-fetch records
