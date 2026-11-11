@@ -1503,8 +1503,10 @@ def test_maybe_validate_positions_no_op_when_epoch_current(fetcher, mocker):
 
 def test_validate_offsets_async_clears_validation_on_matching_epoch(
         fetcher, net, mocker):
-    """OffsetForLeaderEpoch response with matching epoch and end_offset >=
-    position.offset clears awaiting_validation."""
+    """OffsetForLeaderEpoch response with end_offset >= position.offset
+    clears awaiting_validation. The response's leader_epoch is the epoch of
+    the requested point / log-end, not the epoch of the record at the
+    position, so the position's record epoch must be preserved."""
     tp = TopicPartition('foobar', 0)
     fetcher._subscriptions.assignment[tp].seek(OffsetAndMetadata(50, '', 3))
     fetcher._subscriptions.assignment[tp].maybe_validate_position(5)
@@ -1527,7 +1529,9 @@ def test_validate_offsets_async_clears_validation_on_matching_epoch(
     net.run(fetcher._validate_offsets_async, 1000)
 
     assert not fetcher._subscriptions.assignment[tp].awaiting_validation
-    assert fetcher._subscriptions.assignment[tp].position.leader_epoch == 5
+    # The response epoch (5) must NOT overwrite the position's record epoch
+    # (3); only the offset is confirmed against the current leader.
+    assert fetcher._subscriptions.assignment[tp].position.leader_epoch == 3
     assert fetcher._subscriptions.assignment[tp].position.offset == 50
 
 

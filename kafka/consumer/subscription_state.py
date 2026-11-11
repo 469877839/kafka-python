@@ -346,6 +346,13 @@ class SubscriptionState:
         self.assignment[partition].seek(offset)
 
     @synchronized
+    def seek_validated(self, partition, offset):
+        """Seek to a broker-confirmed divergence point, keeping the
+        partition reconciled against the current leader. See
+        :meth:`TopicPartitionState.seek_validated`."""
+        self.assignment[partition].seek_validated(offset)
+
+    @synchronized
     def assigned_partitions(self):
         """Return set of TopicPartitions in current assignment."""
         return set(self.assignment.keys())
@@ -647,6 +654,20 @@ class TopicPartitionState:
         # this offset).
         self._current_leader_epoch = -1
         self.clear_preferred_read_replica()
+
+    def seek_validated(self, offset):
+        """Seek to a broker-confirmed divergence point during validation.
+
+        Unlike :meth:`seek` (a user action whose target is unreconciled), the
+        new position is already validated against the current leader by the
+        OffsetForLeaderEpoch response that produced it, so the reconciled
+        leader epoch is preserved and the partition becomes fetchable
+        immediately rather than being re-marked for validation. Mirrors
+        Java's ``SubscriptionState.seekValidated``.
+        """
+        reconciled = self._current_leader_epoch
+        self.seek(offset)
+        self._current_leader_epoch = reconciled
 
     def pause(self):
         self.paused = True

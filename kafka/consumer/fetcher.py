@@ -1006,6 +1006,15 @@ class Fetcher:
         while not timer.expired:
             if self._cached_log_truncation is not None:
                 return
+            # Reconcile against any leader epoch that advanced while the
+            # previous round was in flight or backing off. Without this, a
+            # partition whose validation failed (retry backoff) while the
+            # cluster elected a newer leader stays gated until an external
+            # poll re-marks it -- and if the backoff window elapses with no
+            # poll in between, the unvalidated position is dropped from the
+            # retry set and becomes fetchable again. This is idempotent:
+            # maybe_validate_position only re-arms on a strictly newer epoch.
+            self.maybe_validate_positions()
             partitions = self._subscriptions.partitions_needing_validation()
             if not partitions:
                 next_retry = self._subscriptions.next_offset_validation_retry_time()
@@ -1181,13 +1190,16 @@ class Fetcher:
                         # Broker confirms the diverging point. Seek there
                         # directly instead of resetting via policy, so the
                         # consumer only re-reads records past the divergence
-                        # (Java: state.seekValidated(newPosition)).
+                        # (Java: state.seekValidated(newPosition)). The seek
+                        # is validated against the current leader, so the
+                        # reconciled epoch is retained and the partition does
+                        # not get re-marked for validation on the next loop.
                         divergent = OffsetAndMetadata(end_offset, '', end_epoch)
                         if has_reset_policy:
                             log.info("Truncation detected for %s at position %s; "
                                      "seeking to first diverging offset %s",
                                      tp, current.offset, divergent)
-                            self._subscriptions.seek(tp, divergent)
+                            self._subscriptions.seek_validated(tp, divergent)
                         else:
                             log.warning("Truncation detected for %s at position %s "
                                         "(first diverging offset is %s), but no reset "
@@ -1195,9 +1207,16 @@ class Fetcher:
                             truncations[tp] = divergent
                             self._subscriptions.complete_validation(tp)
                     else:
-                        validated = OffsetAndMetadata(
-                            current.offset, current.metadata, end_epoch)
-                        self._subscriptions.complete_validation(tp, validated)
+                        # Position confirmed. The response's leader_epoch is
+                        # the epoch of the *requested* point (or a newer
+                        # epoch on some brokers) -- it is NOT the epoch of
+                        # the record at our offset. The position's epoch is
+                        # sent as last_fetched_epoch on Fetch v12+ (KIP-595)
+                        # and as leader_epoch on the next OffsetForLeaderEpoch
+                        # request, so it must keep describing the record we
+                        # actually consumed; only the truncation branch above
+                        # adopts the broker-reported epoch.
+                        self._subscriptions.complete_validation(tp)
 
                 elif error_type in (Errors.FencedLeaderEpochError,
                                     Errors.UnknownLeaderEpochError,

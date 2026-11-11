@@ -19,9 +19,11 @@ from kafka.consumer.fetcher import Fetcher
 from kafka.consumer.subscription_state import SubscriptionState
 from kafka.protocol.consumer import (
     FetchRequest, FetchResponse,
+    ListOffsetsRequest, ListOffsetsResponse,
     OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse,
 )
 from kafka.protocol.metadata import MetadataResponse
+from kafka.record.memory_records import MemoryRecordsBuilder
 from kafka.structs import OffsetAndMetadata, TopicPartition
 
 
@@ -139,8 +141,10 @@ class TestKIP320OffsetValidation:
 
         assert 'version' in captured, 'OffsetForLeaderEpochRequest never reached broker'
         assert not fetcher._subscriptions.assignment[tp].awaiting_validation
-        # Position's epoch advanced to the broker-confirmed epoch.
-        assert fetcher._subscriptions.assignment[tp].position.leader_epoch == 5
+        # No truncation: the offset is confirmed but the position keeps the
+        # record epoch of the record it actually consumed (3); the response
+        # epoch is the requested/log-end point, not the record's epoch.
+        assert fetcher._subscriptions.assignment[tp].position.leader_epoch == 3
         assert fetcher._subscriptions.assignment[tp].position.offset == 50
 
     def test_validated_position_not_revalidated_forever(
@@ -374,7 +378,9 @@ class TestKIP320OffsetValidation:
         elapsed = time.monotonic() - start
 
         assert not fetcher._subscriptions.assignment[tp].awaiting_validation
-        assert fetcher._subscriptions.assignment[tp].position.leader_epoch == 5
+        # Validation succeeded without truncation; the position's record
+        # epoch is preserved (the response epoch is not the record's epoch).
+        assert fetcher._subscriptions.assignment[tp].position.leader_epoch == 3
         assert elapsed >= 0.05, (
             '_validate_offsets_async did not sleep for retry_backoff_ms; %.3fs'
             % elapsed)
@@ -740,3 +746,603 @@ class TestFetchV12Epoch:
 
         assert manager.cluster.leader_for_partition(tp) == broker.node_id
         assert manager.cluster.leader_epoch_for_partition(tp) == 3
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic leader-epoch (KIP-320) regression matrix                      #
+#                                                                             #
+# Every test below is driven by scripted MockBroker replies. Expected states #
+# are derived from the protocol semantics and the configured reset policy,   #
+# not copied from the implementation:                                        #
+#                                                                             #
+#   * A partition is fetchable only with a valid position AND no pending     #
+#     truncation validation AND no pending reset.                            #
+#   * OffsetForLeaderEpoch: end_offset < position means the consumer has     #
+#     read into a region the new leader truncated; end_offset/-1 epoch means  #
+#     the broker has no record of the requested epoch at all.                #
+#   * FENCED/UNKNOWN epoch responses are retriable: the partition stays      #
+#     gated until an authoritative reply lands.                              #
+#   * With an auto reset policy (earliest/latest) the consumer self-heals;   #
+#     with NONE the exception is delivered to the caller and the position is #
+#     left untouched.                                                        #
+#   * A reply that no longer matches the position (seek/rebalance/epoch      #
+#     advance since the request was sent) must be ignored.                   #
+#   * No usable epoch (legacy metadata, bare seek) => nothing to validate,   #
+#     so the partition stays fetchable without any OffsetForLeaderEpoch RPC. #
+
+
+class _EventRecorder:
+    """Minimal, deterministic event log for a scripted validation flow.
+
+    Events are recorded from the broker handler (which runs on the mock
+    transport's event loop) and from the test thread. The selector backend
+    used by these tests runs the loop inline (``net.poll`` / ``net.run``
+    from the test thread), so ordering is strictly sequential.
+    """
+
+    def __init__(self):
+        self.events = []
+
+    def add(self, *event):
+        self.events.append(event)
+
+    def ofle_requests(self):
+        return [e for e in self.events if e[0] == 'ofle_req']
+
+
+def _record_batch(msgs, offset=0):
+    """Build a magic-2 record batch starting at ``offset``.
+
+    ``msgs`` is a list of ``(key, value)`` byte pairs.
+    """
+    builder = MemoryRecordsBuilder(
+        magic=2, compression_type=0, batch_size=9999999, offset=offset)
+    for key, value in msgs:
+        builder.append(key=key, value=value, timestamp=0, headers=[])
+    builder.close()
+    return builder.buffer()
+
+
+def _fetch_response_with_records(records, high_watermark=200):
+    return FetchResponse(
+        throttle_time_ms=0, error_code=0, session_id=0,
+        responses=[_FetchTopic(topic=TOPIC, partitions=[_FetchPartition(
+            partition_index=PARTITION, error_code=0,
+            high_watermark=high_watermark, last_stable_offset=-1,
+            log_start_offset=-1, aborted_transactions=[],
+            preferred_read_replica=-1, records=records)])])
+
+
+def _list_offsets_response(offset, leader_epoch=5):
+    Topic = ListOffsetsResponse.ListOffsetsTopicResponse
+    Partition = Topic.ListOffsetsPartitionResponse
+    return ListOffsetsResponse(
+        0,  # throttle_time_ms
+        [Topic(name=TOPIC, partitions=[Partition(
+            partition_index=PARTITION, error_code=0, old_style_offsets=[],
+            timestamp=-1, offset=offset, leader_epoch=leader_epoch)],
+            version=7)],
+        version=7)
+
+
+def _pump_until(net, predicate, timeout_ms=2000):
+    """Drive the selector loop until ``predicate()`` is true.
+
+    Returns True if the predicate fired before the deadline. Used to wait
+    for an in-flight request to reach the broker without sleeping blindly.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        net.poll(timeout_ms=10)
+    return predicate()
+
+
+def _ofle_handler(recorder, response):
+    """Broker handler that records the decoded request and returns a fixed
+    OffsetForLeaderEpoch response."""
+    def handler(api_key, api_version, correlation_id, request_bytes):
+        decoded = OffsetForLeaderEpochRequest.decode(
+            request_bytes, version=api_version, header=True)
+        partition = decoded.topics[0].partitions[0]
+        recorder.add('ofle_req',
+                     'current_epoch=%s' % partition.current_leader_epoch,
+                     'last_fetched_epoch=%s' % partition.leader_epoch)
+        return response
+    return handler
+
+
+def _gated_ofle_handler(recorder, net, gate, response):
+    """Broker handler that holds the response until ``gate`` completes.
+
+    Simulates a slow broker: the request is recorded immediately, the reply
+    is delivered only after the test thread resolves ``gate`` -- the window
+    in which the user can seek / a rebalance can revoke / the leader can
+    change again.
+    """
+    async def handler(api_key, api_version, correlation_id, request_bytes):
+        decoded = OffsetForLeaderEpochRequest.decode(
+            request_bytes, version=api_version, header=True)
+        partition = decoded.topics[0].partitions[0]
+        recorder.add('ofle_req',
+                     'current_epoch=%s' % partition.current_leader_epoch,
+                     'last_fetched_epoch=%s' % partition.leader_epoch)
+        await net.await_for(gate, timeout_ms=5000, raise_error=False)
+        recorder.add('ofle_reply',
+                     'end_offset=%s' % response.topics[0].partitions[0].end_offset)
+        return response
+    return handler
+
+
+class TestLeaderEpochValidationRegressions:
+    """Deterministic, protocol-derived regressions for the KIP-320 path.
+
+    The shared ``fetcher`` fixture subscribes TOPIC/PARTITION with the
+    ``earliest`` auto-reset policy. A separate fixture below builds the same
+    wiring with reset policy NONE.
+    """
+
+    TP = TopicPartition(TOPIC, PARTITION)
+
+    @pytest.fixture
+    def recorder(self):
+        return _EventRecorder()
+
+    @pytest.fixture
+    def reset_none_fetcher(self, broker, client, manager, metrics):
+        _broker_metadata(broker, leader_epoch=3)
+        manager.bootstrap(timeout_ms=5000)
+        subs = SubscriptionState(offset_reset_strategy='none')
+        subs.subscribe(topics=[TOPIC])
+        subs.assign_from_subscribed([self.TP])
+        return Fetcher(client, subs, metrics=metrics, retry_backoff_ms=50)
+
+    def test_leader_changes_again_while_validation_in_flight(
+            self, broker, net, manager, fetcher, recorder):
+        """Second leader election during an in-flight validation.
+
+        Setup: position (100, record-epoch 3); cluster epoch 3 -> 5 marks
+        validation. While the OffsetForLeaderEpoch request is in flight the
+        cluster elects yet another leader (epoch 7). The old leader's reply
+        (FENCED) cannot clear the partition. Expected end state derives
+        from the state machine: the new epoch re-marks validation, the
+        partition stays non-fetchable until an authoritative reply against
+        epoch 7 confirms it, and the wire carries the updated
+        current_leader_epoch on the retry.
+        """
+        tp = self.TP
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        _broker_metadata(broker, leader_epoch=5)
+        net.wait_for(manager.cluster.request_update(), 1000)
+        fetcher.maybe_validate_positions()
+        assert fetcher._subscriptions.assignment[tp].awaiting_validation
+        assert not fetcher._subscriptions.is_fetchable(tp)
+
+        # Stage 1: the old leader's reply (FENCED) is held at the broker.
+        # Stage 2: the retry against the new epoch is held too, so the test
+        # can observe the re-armed state before it completes.
+        gate1, gate2 = net.create_future(), net.create_future()
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _gated_ofle_handler(
+                recorder, net, gate1,
+                _ofle_response(Errors.FencedLeaderEpochError.errno, -1, -1)))
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _gated_ofle_handler(
+                recorder, net, gate2,
+                _ofle_response(error_code=0, leader_epoch=3, end_offset=100)))
+
+        task = fetcher._manager.call_soon(fetcher._validate_offsets_async, 5000)
+        assert _pump_until(net, lambda: bool(recorder.ofle_requests()))
+        # Election #2 happens while the first request is still outstanding.
+        # Apply it straight to the cluster cache (equivalent to the metadata
+        # refresh landing on another connection; the mock serializes requests
+        # per connection, so a wire refresh cannot interleave with the gated
+        # OffsetForLeaderEpoch exchange). The same node keeps leadership with
+        # a strictly higher epoch -- the epoch advance is what must gate.
+        assert manager.cluster.update_partition_leader(tp, broker.node_id, 7)
+        assert manager.cluster.leader_epoch_for_partition(tp) == 7
+        gate1.success(None)
+
+        # The FENCED reply cannot validate against epoch 7: the driver must
+        # re-arm and re-issue the request itself (no external poll needed).
+        assert _pump_until(net, lambda: len(recorder.ofle_requests()) >= 2)
+        state = fetcher._subscriptions.assignment[tp]
+        assert state.awaiting_validation
+        assert not state.is_fetchable()
+
+        # The retry names the *new* current epoch on the wire.
+        requests = recorder.ofle_requests()
+        assert 'current_epoch=7' in requests[1]
+        assert 'last_fetched_epoch=3' in requests[1]
+
+        # The authoritative reply against epoch 7 reconciles the partition.
+        gate2.success(None)
+        net.wait_for(task, 5000)
+        assert not state.awaiting_validation
+        assert state.is_fetchable()
+        # No truncation -> offset untouched.
+        assert state.position.offset == 100
+        assert fetcher._cached_log_truncation is None
+
+    def test_success_reply_landing_after_epoch_bump_does_not_validate(
+            self, broker, net, manager, fetcher, recorder):
+        """A *successful* reply from the old leader must not validate the
+        position against the new epoch.
+
+        The OffsetForLeaderEpoch reply was computed by the epoch-5 leader;
+        by the time it is processed the cluster has already moved to epoch
+        7. Accepting it would mark the position reconciled against a leader
+        that never confirmed it. The driver must re-arm validation and
+        re-validate against epoch 7 before the partition becomes fetchable.
+        """
+        tp = self.TP
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        _broker_metadata(broker, leader_epoch=5)
+        net.wait_for(manager.cluster.request_update(), 1000)
+        fetcher.maybe_validate_positions()
+
+        gate1, gate2 = net.create_future(), net.create_future()
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _gated_ofle_handler(
+                recorder, net, gate1,
+                _ofle_response(error_code=0, leader_epoch=3, end_offset=100)))
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _gated_ofle_handler(
+                recorder, net, gate2,
+                _ofle_response(error_code=0, leader_epoch=3, end_offset=100)))
+
+        task = fetcher._manager.call_soon(fetcher._validate_offsets_async, 5000)
+        assert _pump_until(net, lambda: bool(recorder.ofle_requests()))
+        # Election #2 lands while the success reply is still in flight.
+        assert manager.cluster.update_partition_leader(tp, broker.node_id, 7)
+        gate1.success(None)
+
+        # The epoch-5 reply must not complete validation: the driver re-arms
+        # and issues a second request against epoch 7.
+        assert _pump_until(net, lambda: len(recorder.ofle_requests()) >= 2)
+        state = fetcher._subscriptions.assignment[tp]
+        assert state.awaiting_validation
+        assert not state.is_fetchable()
+        assert 'current_epoch=7' in recorder.ofle_requests()[1]
+
+        gate2.success(None)
+        net.wait_for(task, 5000)
+        assert not state.awaiting_validation
+        assert state.is_fetchable()
+        assert state.position.offset == 100
+
+    def test_retriable_error_retries_within_one_driver_and_gates_fetch(
+            self, broker, net, manager, fetcher):
+        """A transient error must not deliver records past truncation.
+
+        The partition stays non-fetchable across the retriable failure, the
+        driver sleeps retry_backoff_ms and retries by itself, and the
+        eventual truncation answer (end_offset 80 < position 100) seeks the
+        position to the broker-confirmed divergence point.
+        """
+        tp = self.TP
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        fetcher._subscriptions.maybe_validate_position_for_current_leader(tp, 5)
+        assert not fetcher._subscriptions.is_fetchable(tp)
+
+        broker.respond(OffsetForLeaderEpochRequest, _ofle_response(
+            error_code=Errors.NotLeaderForPartitionError.errno,
+            leader_epoch=-1, end_offset=-1))
+        broker.respond(OffsetForLeaderEpochRequest,
+                       _ofle_response(error_code=0, leader_epoch=3, end_offset=80))
+
+        start = time.monotonic()
+        net.run(fetcher._validate_offsets_async, 5000)
+        elapsed = time.monotonic() - start
+
+        state = fetcher._subscriptions.assignment[tp]
+        assert not state.awaiting_validation
+        assert fetcher._cached_log_truncation is None
+        # Protocol: end_offset 80 is the first diverging offset -> seek there.
+        assert state.position == OffsetAndMetadata(80, '', 3)
+        assert state.is_fetchable()
+        assert elapsed >= fetcher.config['retry_backoff_ms'] / 1000 - 0.02
+        assert broker.requests_received >= 2
+
+    def test_truncation_does_not_deliver_records_past_divergence(
+            self, broker, net, manager, fetcher, recorder):
+        """The core regression: when the log is truncated, records buffered
+        from the *old* (now-truncated) region must not be delivered, and the
+        consumer must continue at the broker-confirmed divergence point.
+
+        Sequence:
+          1. A fetch at position 100 returns records 100..104 (old leader's
+             log); they sit buffered in the fetcher.
+          2. Before the poll drains them, the cluster epoch advances and the
+             new leader's OffsetForLeaderEpoch reply says the log diverges
+             at offset 80 (records 80.. were rolled back).
+          3. The buffered 100..104 records are now garbage: they must not be
+             returned. The position must move to 80, and the next fetch must
+             request offset 80 -- i.e. the consumer re-reads from the
+             divergence, never delivering records at wrong positions.
+        """
+        tp = self.TP
+        fetcher.config['check_crcs'] = False
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+
+        # 1. Old leader's fetch response: records 100..104, buffered but
+        #    not yet drained by the poll loop.
+        from unittest.mock import MagicMock
+        from kafka.consumer.fetcher import CompletedFetch
+        partition_data = _fetch_response_with_records(
+            _record_batch([(b'k%d' % i, b'v%d' % i) for i in range(100, 105)],
+                          offset=100)).responses[0].partitions[0]
+        fetcher._completed_fetches.append(
+            CompletedFetch(tp, 100, 12, partition_data, MagicMock()))
+
+        # 2. Epoch advances; validation marks the partition and the new
+        #    leader reports divergence at 80.
+        _broker_metadata(broker, leader_epoch=5)
+        net.wait_for(manager.cluster.request_update(), 1000)
+        fetcher.maybe_validate_positions()
+        assert fetcher._subscriptions.assignment[tp].awaiting_validation
+
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _ofle_handler(recorder, _ofle_response(0, 3, 80)))
+        net.run(fetcher._validate_offsets_async, 5000)
+
+        state = fetcher._subscriptions.assignment[tp]
+        assert state.position == OffsetAndMetadata(80, '', 3)
+        assert state.is_fetchable()
+
+        # 3. Draining must not yield the stale 100..104 records: their
+        #    next_fetch_offset (100) no longer matches the position (80).
+        records, _ = fetcher.fetched_records(10, update_offsets=True)
+        assert records == {}, \
+            'stale pre-truncation records were delivered at the wrong position'
+        assert fetcher._subscriptions.assignment[tp].position.offset == 80
+
+        # And the next fetch request goes out at offset 80.
+        requests = fetcher._create_fetch_requests()
+        assert broker.node_id in requests
+        _, fetch_offsets = requests[broker.node_id]
+        assert fetch_offsets[tp] == 80
+
+    def test_truncation_without_reset_policy_raises_and_leaves_position(
+            self, broker, net, manager, reset_none_fetcher, recorder):
+        """Reset policy NONE: the callback surface gets LogTruncationError
+        carrying the divergent offset; the position is NOT moved (the caller
+        decides), nothing is auto-reset, and the exception is reported
+        exactly once."""
+        tp = self.TP
+        fetcher = reset_none_fetcher
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        fetcher._subscriptions.maybe_validate_position_for_current_leader(tp, 5)
+
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _ofle_handler(recorder, _ofle_response(0, 3, 80)))
+        net.run(fetcher._validate_offsets_async, 5000)
+
+        with pytest.raises(Errors.LogTruncationError) as exc_info:
+            fetcher.validate_offsets_if_needed()
+        divergent = exc_info.value.divergent_offsets[tp]
+        assert divergent is not None
+        assert divergent.offset == 80
+        assert divergent.leader_epoch == 3
+
+        state = fetcher._subscriptions.assignment[tp]
+        # With no reset policy the fetcher must not invent a recovery point:
+        # the position is left where it was, nothing is auto-reset, and the
+        # truncation is reported exactly once (the cached exception is consumed
+        # by the call that raised it).
+        assert state.position.offset == 100
+        assert not state.awaiting_reset
+        assert fetcher.validate_offsets_if_needed() is None
+        assert fetcher._cached_log_truncation is None
+
+    def test_user_seek_during_in_flight_validation_ignores_stale_reply(
+            self, broker, net, manager, fetcher, recorder):
+        """The user seeks while a validation reply is outstanding.
+
+        The reply computed for the pre-seek position (100, epoch 3) must not
+        be applied to the post-seek position (200, epoch 4): a seek is an
+        explicit user override, and the reply says nothing about offset 200.
+        The new position is then validated on its own against the current
+        leader epoch.
+        """
+        tp = self.TP
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        _broker_metadata(broker, leader_epoch=5)
+        net.wait_for(manager.cluster.request_update(), 1000)
+        fetcher.maybe_validate_positions()
+        assert fetcher._subscriptions.assignment[tp].awaiting_validation
+
+        # Two staged replies: the first is computed for the pre-seek position
+        # (truncation to 80); the second validates the post-seek position.
+        gate1, gate2 = net.create_future(), net.create_future()
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _gated_ofle_handler(recorder, net, gate1, _ofle_response(0, 3, 80)))
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _gated_ofle_handler(recorder, net, gate2, _ofle_response(0, 4, 250)))
+        task = fetcher._manager.call_soon(fetcher._validate_offsets_async, 5000)
+        assert _pump_until(net, lambda: bool(recorder.ofle_requests()))
+
+        # User seeks while the broker holds the first reply.
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(200, '', 4))
+        gate1.success(None)
+
+        # The stale reply (end_offset 80 for the old position) was ignored:
+        # the position is still the user's seek target, not 80, and the
+        # driver re-arms validation for the new position on its own.
+        assert _pump_until(net, lambda: len(recorder.ofle_requests()) >= 2)
+        state = fetcher._subscriptions.assignment[tp]
+        assert state.position == OffsetAndMetadata(200, '', 4)
+        assert not state.awaiting_reset
+        assert fetcher._cached_log_truncation is None
+        assert state.awaiting_validation
+        assert not state.is_fetchable()
+
+        # The retry validates the seeked position's own record epoch.
+        assert 'last_fetched_epoch=4' in recorder.ofle_requests()[1]
+        gate2.success(None)
+        net.wait_for(task, 5000)
+        assert not state.awaiting_validation
+        assert state.is_fetchable()
+        assert state.position.offset == 200
+        assert state.position.leader_epoch == 4
+
+    def test_stale_reply_after_revocation_is_ignored(
+            self, broker, net, manager, fetcher, recorder):
+        """A rebalance revokes the partition while the validation reply is
+        outstanding. The late reply must not touch the (now re-assigned)
+        partition state, must not be cached as a truncation, and must not
+        crash the driver."""
+        tp = self.TP
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        fetcher._subscriptions.maybe_validate_position_for_current_leader(tp, 5)
+
+        gate = net.create_future()
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _gated_ofle_handler(recorder, net, gate, _ofle_response(0, 3, 80)))
+        task = fetcher._manager.call_soon(fetcher._validate_offsets_async, 5000)
+        assert _pump_until(net, lambda: bool(recorder.ofle_requests()))
+
+        # Revocation: the partition leaves the assignment entirely.
+        fetcher._subscriptions.assign_from_subscribed([])
+        assert tp not in fetcher._subscriptions.assignment
+        gate.success(None)
+        net.wait_for(task, 5000)
+
+        # The truncation reply for the revoked partition was discarded.
+        assert fetcher._cached_log_truncation is None
+
+        # Re-assignment starts from a clean state; the old reply must not
+        # leak into it.
+        fetcher._subscriptions.assign_from_subscribed([tp])
+        state = fetcher._subscriptions.assignment[tp]
+        assert state.position is None
+        assert not state.awaiting_validation
+        assert not state.awaiting_reset
+
+    def test_old_broker_without_epoch_info_keeps_partition_fetchable(
+            self, broker, net, manager, fetcher, recorder):
+        """Legacy brokers (no leader_epoch in metadata, positions without a
+        record epoch) cannot be validated -- and must not be gated either.
+
+        KIP-320 only applies when epochs are available; with no epoch
+        information the consumer falls back to pre-KIP-320 behavior: fetch
+        directly, no OffsetForLeaderEpoch RPC on the wire.
+        """
+        tp = self.TP
+        state = fetcher._subscriptions.assignment[tp]
+
+        # Case 1: metadata carries no epoch (pre-2.4 broker / unreliable
+        # epoch), position has one. Nothing to validate against.
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        manager.cluster._partitions[TOPIC][PARTITION].leader_epoch = -1
+        fetcher.maybe_validate_positions()
+        assert not state.awaiting_validation
+        assert state.is_fetchable()
+
+        # Case 2: metadata has an epoch but the position does not (bare seek
+        # to an offset). There is no record epoch to validate.
+        manager.cluster._partitions[TOPIC][PARTITION].leader_epoch = 5
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', -1))
+        fetcher.maybe_validate_positions()
+        assert not state.awaiting_validation
+        assert state.is_fetchable()
+
+        # The validation driver is a no-op and sends nothing on the wire.
+        received_before = broker.requests_received
+        net.run(fetcher._validate_offsets_async, 500)
+        assert broker.requests_received == received_before
+        assert recorder.ofle_requests() == []
+
+    def test_successful_validation_preserves_position_record_epoch(
+            self, broker, net, manager, fetcher, recorder):
+        """A no-truncation reply confirms the position; it must not rewrite
+        the position's record epoch.
+
+        The OffsetForLeaderEpoch response's leader_epoch is the epoch of the
+        *requested* point (or, on some brokers, a newer epoch) -- it is NOT
+        the epoch of the record at the consumer's offset. The position's
+        leader_epoch is sent as last_fetched_epoch on Fetch v12+ for KIP-595
+        divergence detection; overwriting it with the response epoch would
+        misreport which epoch the consumer's last record belongs to.
+        """
+        tp = self.TP
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(50, '', 3))
+        _broker_metadata(broker, leader_epoch=5)
+        net.wait_for(manager.cluster.request_update(), 1000)
+        fetcher.maybe_validate_positions()
+
+        # Broker answers with a NEWER epoch than the position's record epoch
+        # (e.g. the epoch of the log-end entry), end_offset beyond position.
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _ofle_handler(recorder, _ofle_response(0, 9, 100)))
+        net.run(fetcher._validate_offsets_async, 5000)
+
+        state = fetcher._subscriptions.assignment[tp]
+        assert not state.awaiting_validation
+        assert state.is_fetchable()
+        assert state.position.offset == 50
+        assert state.position.leader_epoch == 3, (
+            'validation success must not rewrite the record epoch of the '
+            'position (it feeds last_fetched_epoch on Fetch v12+)')
+
+        # The partition is reconciled against cluster epoch 5, so the next
+        # poll does not re-validate...
+        fetcher.maybe_validate_positions()
+        assert not state.awaiting_validation
+        # ...but a further election (epoch 7) does, and the wire still
+        # carries the position's true record epoch as last_fetched_epoch.
+        _broker_metadata(broker, leader_epoch=7)
+        net.wait_for(manager.cluster.request_update(), 1000)
+        fetcher.maybe_validate_positions()
+        assert state.awaiting_validation
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _ofle_handler(recorder, _ofle_response(0, 3, 100)))
+        net.run(fetcher._validate_offsets_async, 5000)
+        last_request = recorder.ofle_requests()[-1]
+        assert 'last_fetched_epoch=3' in last_request
+        assert 'current_epoch=7' in last_request
+
+    def test_undefined_epoch_response_makes_reset_allowed_and_resets(
+            self, broker, net, manager, fetcher, recorder):
+        """UNDEFINED epoch response with a reset policy: the partition moves
+        to awaiting-reset (not awaiting-validation), becomes resettable
+        immediately, and the ListOffsets reset drives it to the policy
+        offset, after which it is fetchable again."""
+        tp = self.TP
+        fetcher._subscriptions.seek(tp, OffsetAndMetadata(100, '', 3))
+        fetcher._subscriptions.maybe_validate_position_for_current_leader(tp, 5)
+
+        broker.respond_fn(
+            OffsetForLeaderEpochRequest,
+            _ofle_handler(recorder, _ofle_response(0, -1, -1)))
+        net.run(fetcher._validate_offsets_async, 5000)
+
+        state = fetcher._subscriptions.assignment[tp]
+        # No known divergence point -> fall back to the reset policy.
+        assert state.awaiting_reset
+        assert not state.awaiting_validation
+        assert state.is_reset_allowed()
+        assert not state.is_fetchable()
+        assert fetcher._cached_log_truncation is None
+        assert tp in fetcher._subscriptions.partitions_needing_reset()
+
+        # The reset itself goes through ListOffsets (earliest policy -> 5).
+        broker.respond(ListOffsetsRequest, _list_offsets_response(5))
+        net.run(fetcher._reset_offsets_async, 5000)
+
+        assert not state.awaiting_reset
+        assert state.position is not None
+        assert state.position.offset == 5
+        assert state.is_fetchable()
