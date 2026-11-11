@@ -3,6 +3,8 @@ import io
 import platform
 import struct
 
+from kafka.errors import DecompressedSizeLimitExceededError
+
 
 _XERIAL_V1_HEADER = (-126, b'S', b'N', b'A', b'P', b'P', b'Y', 0, 1, 1)
 _XERIAL_V1_FORMAT = 'bccccccBii'
@@ -91,14 +93,31 @@ def gzip_encode(payload, compresslevel=None):
     return buf.getvalue()
 
 
-def gzip_decode(payload):
+def gzip_decode(payload, limit=None):
     buf = io.BytesIO(payload)
 
     # Gzip context manager introduced in python 2.7
     # so old-fashioned way until we decide to not support 2.6
     gzipper = gzip.GzipFile(fileobj=buf, mode='r')
     try:
-        return gzipper.read()
+        if limit is None:
+            return gzipper.read()
+        # Read incrementally so that a highly-compressed payload (e.g. a
+        # "zip bomb") is rejected as soon as it grows past `limit`, without
+        # ever materializing more than `limit` bytes of decompressed output.
+        chunks = []
+        total = 0
+        while True:
+            chunk = gzipper.read(io.DEFAULT_BUFFER_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise DecompressedSizeLimitExceededError(
+                    "Decompressed size exceeds limit of {} bytes".format(limit),
+                    limit=limit, observed=total)
+            chunks.append(chunk)
+        return b"".join(chunks)
     finally:
         gzipper.close()
 

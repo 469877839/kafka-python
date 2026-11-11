@@ -56,11 +56,16 @@
 
 import struct
 import time
+import zlib
 from kafka.record.abc import ABCRecord, ABCRecordBatch, ABCRecordBatchBuilder
 from kafka.record.util import (
     decode_varint, encode_varint, calc_crc32c, size_of_varint
 )
-from kafka.errors import CorruptRecordError, UnsupportedCodecError
+from kafka.errors import (
+    CorruptRecordError, UnsupportedCodecError,
+    DecompressedSizeLimitExceededError, RecordCountLimitExceededError,
+    TruncatedRecordError, UnsupportedDecompressionLimitError,
+)
 from kafka.codec import (
     gzip_encode, snappy_encode, lz4_encode, zstd_encode,
     gzip_decode, snappy_decode, lz4_decode, zstd_decode
@@ -126,16 +131,39 @@ class DefaultRecordBase:
 
 class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
-    __slots__ = ("_buffer", "_header_data", "_pos", "_num_records",
-                 "_next_record_index", "_decompressed")
+    # Codecs whose decode interfaces can enforce a decompressed-byte limit
+    # incrementally (i.e. without materializing the unbounded output first).
+    LIMITABLE_CODECS = (DefaultRecordBase.CODEC_NONE, DefaultRecordBase.CODEC_GZIP)
 
-    def __init__(self, buffer):
+    __slots__ = ("_buffer", "_header_data", "_pos", "_num_records",
+                 "_next_record_index", "_decompressed",
+                 "_max_decompressed_bytes", "_max_records")
+
+    def __init__(self, buffer, max_decompressed_bytes=None, max_records=None):
         self._buffer = bytearray(buffer)
         self._header_data = self.HEADER_STRUCT.unpack_from(self._buffer)
         self._pos = self.HEADER_STRUCT.size
         self._num_records = self._header_data[12]
         self._next_record_index = 0
         self._decompressed = False
+        self._max_decompressed_bytes = max_decompressed_bytes
+        self._max_records = max_records
+        self._check_decode_limits()
+
+    def _check_decode_limits(self):
+        # Refuse configurations we cannot enforce, rather than pretending
+        # the decode is bounded.
+        if self._max_decompressed_bytes is not None:
+            if self.compression_type not in self.LIMITABLE_CODECS:
+                raise UnsupportedDecompressionLimitError(
+                    "max_decompressed_bytes is not supported for compression "
+                    "type {}: its decode interface cannot enforce the limit "
+                    "incrementally".format(self.compression_type))
+        if self._max_records is not None and self._num_records > self._max_records:
+            raise RecordCountLimitExceededError(
+                "Batch declares {} records, exceeding the limit of {}".format(
+                    self._num_records, self._max_records),
+                limit=self._max_records, observed=self._num_records)
 
     @property
     def base_offset(self):
@@ -238,16 +266,45 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
                 self._assert_has_codec(compression_type)
                 data = memoryview(self._buffer)[self._pos:]
                 if compression_type == self.CODEC_GZIP:
-                    uncompressed = gzip_decode(data)
-                if compression_type == self.CODEC_SNAPPY:
+                    try:
+                        uncompressed = gzip_decode(
+                            data, limit=self._max_decompressed_bytes)
+                    except EOFError as err:
+                        # E.g. "Compressed file ended before the end-of-stream
+                        # marker was reached"
+                        raise TruncatedRecordError(
+                            "Truncated gzip-compressed record batch: {!r}".format(
+                                err))
+                    except (OSError, zlib.error) as err:
+                        # gzip.BadGzipFile (bad header, failed checksum, ...)
+                        # or zlib.error (corrupt deflate stream)
+                        raise CorruptRecordError(
+                            "Failed to gzip-decode record batch: {!r}".format(
+                                err))
+                elif compression_type == self.CODEC_SNAPPY:
                     uncompressed = snappy_decode(data.tobytes())
-                if compression_type == self.CODEC_LZ4:
+                elif compression_type == self.CODEC_LZ4:
                     uncompressed = lz4_decode(data.tobytes())
-                if compression_type == self.CODEC_ZSTD:
+                elif compression_type == self.CODEC_ZSTD:
                     uncompressed = zstd_decode(data.tobytes())
+                else:
+                    uncompressed = None
                 self._buffer = bytearray(uncompressed)  # pylint: disable=E0606
                 self._pos = 0
+                self._check_decompressed_size()
+            elif self._max_decompressed_bytes is not None:
+                # Uncompressed payload: the remaining buffer is the
+                # decompressed output.
+                self._check_decompressed_size()
         self._decompressed = True
+
+    def _check_decompressed_size(self):
+        limit = self._max_decompressed_bytes
+        if limit is not None and len(self._buffer) - self._pos > limit:
+            raise DecompressedSizeLimitExceededError(
+                "Decompressed size of {} bytes exceeds limit of {}".format(
+                    len(self._buffer) - self._pos, limit),
+                limit=limit, observed=len(self._buffer) - self._pos)
 
     def _read_msg(
             self,
@@ -264,6 +321,7 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
         #     HeaderValue => Bytes
 
         buffer = self._buffer
+        buffer_len = len(buffer)
         pos = self._pos
         length, pos = decode_varint(buffer, pos)
         start_pos = pos
@@ -280,6 +338,10 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
         key_len, pos = decode_varint(buffer, pos)
         if key_len >= 0:
+            if pos + key_len > buffer_len:
+                raise TruncatedRecordError(
+                    "Record key of {} bytes exceeds remaining batch buffer "
+                    "({} bytes)".format(key_len, buffer_len - pos))
             key = bytes(buffer[pos: pos + key_len])
             pos += key_len
         else:
@@ -287,6 +349,10 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
         value_len, pos = decode_varint(buffer, pos)
         if value_len >= 0:
+            if pos + value_len > buffer_len:
+                raise TruncatedRecordError(
+                    "Record value of {} bytes exceeds remaining batch buffer "
+                    "({} bytes)".format(value_len, buffer_len - pos))
             value = bytes(buffer[pos: pos + value_len])
             pos += value_len
         else:
@@ -303,12 +369,22 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
             if h_key_len < 0:
                 raise CorruptRecordError(
                     "Invalid negative header key size {}".format(h_key_len))
+            if pos + h_key_len > buffer_len:
+                raise TruncatedRecordError(
+                    "Record header key of {} bytes exceeds remaining batch "
+                    "buffer ({} bytes)".format(
+                        h_key_len, buffer_len - pos))
             h_key = buffer[pos: pos + h_key_len].decode("utf-8")
             pos += h_key_len
 
             # Value is of type NULLABLE_BYTES, so it can be None
             h_value_len, pos = decode_varint(buffer, pos)
             if h_value_len >= 0:
+                if pos + h_value_len > buffer_len:
+                    raise TruncatedRecordError(
+                        "Record header value of {} bytes exceeds remaining "
+                        "batch buffer ({} bytes)".format(
+                            h_value_len, buffer_len - pos))
                 h_value = bytes(buffer[pos: pos + h_value_len])
                 pos += h_value_len
             else:
@@ -342,9 +418,20 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
                     "{} unconsumed bytes after all records consumed".format(
                         len(self._buffer) - self._pos))
             raise StopIteration
+        if (self._max_records is not None and
+                self._next_record_index >= self._max_records):
+            raise RecordCountLimitExceededError(
+                "Record count limit of {} reached while batch still declares "
+                "{} records".format(self._max_records, self._num_records),
+                limit=self._max_records, observed=self._next_record_index)
         try:
             msg = self._read_msg()
-        except (ValueError, IndexError) as err:
+        except IndexError as err:
+            # Reads ran past the end of the batch buffer: the batch was
+            # truncated.
+            raise TruncatedRecordError(
+                "Truncated record structure: {!r}".format(err))
+        except ValueError as err:
             raise CorruptRecordError(
                 "Found invalid record structure: {!r}".format(err))
         else:

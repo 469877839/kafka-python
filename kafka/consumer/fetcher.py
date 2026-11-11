@@ -1669,7 +1669,7 @@ class Fetcher:
                     last_batch = batch
 
                     if self.check_crcs and not batch.validate_crc():
-                        raise Errors.CorruptRecordError(
+                        raise Errors.RecordChecksumError(
                                 "Record batch for partition %s at offset %s failed crc check" % (
                                     self.topic_partition, batch.base_offset))
 
@@ -1707,7 +1707,7 @@ class Fetcher:
 
                     for record in batch:
                         if self.check_crcs and not record.validate_crc():
-                            raise Errors.CorruptRecordError(
+                            raise Errors.RecordChecksumError(
                                     "Record for partition %s at offset %s failed crc check" % (
                                         self.topic_partition, record.offset))
                         key_size = len(record.key) if record.key is not None else -1

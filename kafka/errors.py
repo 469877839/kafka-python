@@ -135,6 +135,36 @@ class UnsupportedCodecError(KafkaError):
     pass
 
 
+class UnsupportedDecompressionLimitError(UnsupportedCodecError):
+    """Raised when decode limits are requested for a codec whose existing
+    interface cannot enforce them incrementally, rather than silently
+    decompressing without a bound."""
+
+
+class RecordDecodeLimitError(KafkaError):
+    """Base class for record batch decode limits.
+
+    Attributes:
+        limit (int): configured limit that was exceeded.
+        observed (int): value measured when the limit was exceeded.
+    """
+
+    def __init__(self, message, limit, observed):
+        super().__init__(message)
+        self.limit = limit
+        self.observed = observed
+
+
+class DecompressedSizeLimitExceededError(RecordDecodeLimitError):
+    """Raised when a compressed batch decompresses past the configured
+    decompressed-byte limit."""
+
+
+class RecordCountLimitExceededError(RecordDecodeLimitError):
+    """Raised when a batch declares more records than the configured
+    record-count limit."""
+
+
 class TransactionAbortedError(KafkaError):
     """Raised on undrained batches when a transaction is aborted with no
     underlying cause -- the user chose to abort (KIP-654). Non-fatal: the
@@ -185,6 +215,19 @@ class CorruptRecordError(BrokerResponseError):
 
 # Backward compatibility
 CorruptRecordException = CorruptRecordError
+
+
+class RecordChecksumError(CorruptRecordError):
+    """Raised when a record or batch fails its CRC checksum validation.
+
+    Subclass of :class:`CorruptRecordError` so existing handlers keep working,
+    but allows checksum failures to be told apart from truncation and decode
+    limits.
+    """
+
+
+class TruncatedRecordError(CorruptRecordError):
+    """Raised when a record batch ends before all declared bytes are read."""
 
 
 class UnknownTopicOrPartitionError(InvalidMetadataError, BrokerResponseError):

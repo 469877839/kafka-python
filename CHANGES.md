@@ -1,3 +1,18 @@
+# Unreleased
+
+### Features
+* Add optional per-batch decode limits (`max_decompressed_bytes`, `max_records`)
+  to `MemoryRecords`, `DefaultRecordBatch` and `LegacyRecordBatch`, guarding
+  against highly-compressed ("zip bomb") record batches. Limits are enforced
+  incrementally for the pure-Python uncompressed and gzip paths; codecs whose
+  decode interface cannot bound output incrementally raise
+  `UnsupportedDecompressionLimitError` instead of decoding unbounded. New
+  distinguishable errors: `DecompressedSizeLimitExceededError`,
+  `RecordCountLimitExceededError` (both `RecordDecodeLimitError`),
+  `TruncatedRecordError` and `RecordChecksumError` (both
+  `CorruptRecordError` subclasses). Default behavior without limits is
+  unchanged.
+
 # 3.0.13 (Nov 5, 2026)
 
 ### Fixes

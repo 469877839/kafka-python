@@ -36,14 +36,21 @@ class MemoryRecords(ABCRecords):
     # Minimum space requirements for Record V0
     MIN_SLICE = LOG_OVERHEAD + LegacyRecordBatch.RECORD_OVERHEAD_V0
 
-    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes")
+    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes",
+                 "_max_decompressed_bytes", "_max_records")
 
-    def __init__(self, bytes_data):
+    def __init__(self, bytes_data, max_decompressed_bytes=None,
+                 max_records=None):
         self._buffer = bytes_data
         self._pos = 0
         # We keep one slice ahead so `has_next` will return very fast
         self._next_slice = None
         self._remaining_bytes = None
+        # Optional per-batch decode limits. The position of the next batch
+        # is advanced before a batch is constructed, so a limit error raised
+        # while decoding one batch never loses the position of the next one.
+        self._max_decompressed_bytes = max_decompressed_bytes
+        self._max_records = max_records
         self._cache_next()
 
     def size_in_bytes(self):
@@ -104,9 +111,15 @@ class MemoryRecords(ABCRecords):
         self._cache_next()
         magic, = struct.unpack_from(">b", next_slice, _magic_offset)
         if magic <= 1:
-            return LegacyRecordBatch(next_slice, magic)
+            return LegacyRecordBatch(
+                next_slice, magic,
+                max_decompressed_bytes=self._max_decompressed_bytes,
+                max_records=self._max_records)
         else:
-            return DefaultRecordBatch(next_slice)
+            return DefaultRecordBatch(
+                next_slice,
+                max_decompressed_bytes=self._max_decompressed_bytes,
+                max_records=self._max_records)
 
     def __iter__(self):
         return self

@@ -43,6 +43,7 @@
 
 import struct
 import time
+import zlib
 
 from kafka.record.abc import ABCRecord, ABCRecordBatch, ABCRecordBatchBuilder
 from kafka.record.util import calc_crc32
@@ -52,7 +53,11 @@ from kafka.codec import (
     gzip_decode, snappy_decode, lz4_decode, lz4_decode_old_kafka,
 )
 import kafka.codec as codecs
-from kafka.errors import CorruptRecordError, UnsupportedCodecError
+from kafka.errors import (
+    CorruptRecordError, UnsupportedCodecError,
+    DecompressedSizeLimitExceededError, RecordCountLimitExceededError,
+    TruncatedRecordError, UnsupportedDecompressionLimitError,
+)
 
 
 class LegacyRecordBase:
@@ -132,10 +137,16 @@ class LegacyRecordBase:
 
 class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
 
-    __slots__ = ("_buffer", "_magic", "_offset", "_length", "_crc", "_timestamp",
-                 "_attributes", "_decompressed")
+    # Codecs whose decode interfaces can enforce a decompressed-byte limit
+    # incrementally (i.e. without materializing the unbounded output first).
+    LIMITABLE_CODECS = (LegacyRecordBase.CODEC_NONE, LegacyRecordBase.CODEC_GZIP)
 
-    def __init__(self, buffer, magic):
+    __slots__ = ("_buffer", "_magic", "_offset", "_length", "_crc", "_timestamp",
+                 "_attributes", "_decompressed",
+                 "_max_decompressed_bytes", "_max_records")
+
+    def __init__(self, buffer, magic, max_decompressed_bytes=None,
+                 max_records=None):
         self._buffer = memoryview(buffer)
         self._magic = magic
 
@@ -149,6 +160,14 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
         self._timestamp = timestamp
         self._attributes = attrs
         self._decompressed = False
+        self._max_decompressed_bytes = max_decompressed_bytes
+        self._max_records = max_records
+        if (max_decompressed_bytes is not None and
+                self.compression_type not in self.LIMITABLE_CODECS):
+            raise UnsupportedDecompressionLimitError(
+                "max_decompressed_bytes is not supported for compression "
+                "type {}: its decode interface cannot enforce the limit "
+                "incrementally".format(self.compression_type))
 
     @property
     def base_offset(self):
@@ -202,7 +221,15 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
         compression_type = self.compression_type
         self._assert_has_codec(compression_type)
         if compression_type == self.CODEC_GZIP:
-            uncompressed = gzip_decode(data)
+            try:
+                uncompressed = gzip_decode(
+                    data, limit=self._max_decompressed_bytes)
+            except EOFError as err:
+                raise TruncatedRecordError(
+                    "Truncated gzip-compressed record batch: {!r}".format(err))
+            except (OSError, zlib.error) as err:
+                raise CorruptRecordError(
+                    "Failed to gzip-decode record batch: {!r}".format(err))
         elif compression_type == self.CODEC_SNAPPY:
             uncompressed = snappy_decode(data.tobytes())
         elif compression_type == self.CODEC_LZ4:
@@ -210,6 +237,8 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
                 uncompressed = lz4_decode_old_kafka(data.tobytes())
             else:
                 uncompressed = lz4_decode(data.tobytes())
+        else:
+            uncompressed = None
         return uncompressed  # pylint: disable=E0606
 
     def _read_header(self, pos):
@@ -271,6 +300,7 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
             # If relative offset is used, we need to decompress the entire
             # message first to compute the absolute offset.
             headers = self._read_all_headers()
+            self._check_limits(len(headers), len(self._buffer))
             if self._magic > 0:
                 msg_header, _ = headers[-1]
                 absolute_base_offset = self._offset - msg_header[0]
@@ -299,11 +329,25 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
                     self._magic, offset, timestamp, timestamp_type,
                     key, value, crc, crc_bytes)
         else:
+            self._check_limits(1, len(self._buffer))
             key, value = self._read_key_value(key_offset)
             crc_bytes = self._crc_bytes(0, len(self._buffer) - self.LOG_OVERHEAD)
             yield LegacyRecord(
                 self._magic, self._offset, self._timestamp, timestamp_type,
                 key, value, self._crc, crc_bytes)
+
+    def _check_limits(self, record_count, decompressed_size):
+        if self._max_records is not None and record_count > self._max_records:
+            raise RecordCountLimitExceededError(
+                "Batch contains {} records, exceeding the limit of {}".format(
+                    record_count, self._max_records),
+                limit=self._max_records, observed=record_count)
+        limit = self._max_decompressed_bytes
+        if limit is not None and decompressed_size > limit:
+            raise DecompressedSizeLimitExceededError(
+                "Decompressed size of {} bytes exceeds limit of {}".format(
+                    decompressed_size, limit),
+                limit=limit, observed=decompressed_size)
 
 
 class LegacyRecord(ABCRecord):

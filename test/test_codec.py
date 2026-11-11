@@ -1,8 +1,10 @@
+import io
 import platform
 import struct
 
 import pytest
 
+import kafka.errors as Errors
 from kafka.codec import (
     has_snappy, has_lz4, has_zstd,
     gzip_encode, gzip_decode,
@@ -20,6 +22,39 @@ def test_gzip():
         b1 = random_string(100).encode('utf-8')
         b2 = gzip_decode(gzip_encode(b1))
         assert b1 == b2
+
+
+def test_gzip_decode_limit_rejects_high_ratio_input():
+    # Repeated bytes compress to a tiny fraction of their raw size, so no
+    # large fixture is needed.
+    payload = b"A" * (64 * 1024)
+    compressed = gzip_encode(payload)
+    assert len(compressed) < 1024
+
+    # Small limit: the decoder must stop as soon as output crosses it
+    # without materializing the full payload.
+    limit = 4096
+    with pytest.raises(Errors.DecompressedSizeLimitExceededError) as exc_info:
+        gzip_decode(compressed, limit=limit)
+    assert exc_info.value.limit == limit
+    assert exc_info.value.observed > limit
+    assert exc_info.value.observed <= limit + io.DEFAULT_BUFFER_SIZE
+
+    # Limit at or above the real size still round-trips exactly.
+    assert gzip_decode(compressed, limit=len(payload)) == payload
+    # Default (no limit) behavior is unchanged.
+    assert gzip_decode(compressed) == payload
+
+
+def test_gzip_decode_limit_truncated_input():
+    # A truncated stream is a truncation error, not a limit error: EOFError
+    # surfaces from both the limited and the default read paths.
+    compressed = gzip_encode(b"B" * (32 * 1024))
+    truncated = compressed[:len(compressed) // 2]
+    with pytest.raises(EOFError):
+        gzip_decode(truncated, limit=10 ** 9)
+    with pytest.raises(EOFError):
+        gzip_decode(truncated)
 
 
 @pytest.mark.skipif(not has_snappy(), reason="Snappy not available")

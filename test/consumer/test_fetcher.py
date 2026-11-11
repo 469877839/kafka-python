@@ -838,6 +838,22 @@ def test__unpack_records_corrupted(mocker):
         part_records.take(10)
 
 
+def test__unpack_records_batch_checksum_error_is_distinct(mocker):
+    tp = TopicPartition('foo', 0)
+    messages = [(None, b"a", None)]
+    memory_records = MemoryRecords(_build_record_batch(messages))
+    from kafka.record.default_records import DefaultRecordBatch
+    mocker.patch.object(DefaultRecordBatch, 'validate_crc', return_value=False)
+    part_records = Fetcher.PartitionRecords(0, tp, memory_records)
+    with pytest.raises(Errors.RecordChecksumError):
+        part_records.take(10)
+    # Backwards compatible: still a CorruptRecordError, but distinguishable
+    # from truncation and decode-limit errors.
+    assert issubclass(Errors.RecordChecksumError, Errors.CorruptRecordError)
+    assert not issubclass(Errors.RecordChecksumError, Errors.TruncatedRecordError)
+    assert not issubclass(Errors.RecordChecksumError, Errors.RecordDecodeLimitError)
+
+
 def test__parse_fetched_data(fetcher, topic, mocker):
     fetcher.config['check_crcs'] = False
     tp = TopicPartition(topic, 0)

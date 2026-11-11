@@ -123,9 +123,19 @@ class ABCRecords(ABC):
     __slots__ = ()
 
     @abstractmethod
-    def __init__(self, buffer):
+    def __init__(self, buffer, max_decompressed_bytes=None, max_records=None):
         """ Initialize with bytes-like object conforming to the buffer
             interface (ie. bytes, bytearray, memoryview etc.).
+
+        Optional decode limits (applied per batch, ``None`` keeps the
+        default unlimited behavior):
+            max_decompressed_bytes (int): refuse a batch whose decompressed
+                record payload would exceed this many bytes. Only codecs
+                that can enforce the bound incrementally accept it; others
+                raise UnsupportedDecompressionLimitError.
+            max_records (int): refuse a batch that declares more records
+                than this. No partial record is ever delivered once a limit
+                is reached.
         """
 
     @abstractmethod
