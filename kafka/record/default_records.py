@@ -487,17 +487,21 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
 
     __slots__ = ("_magic", "_compression_type", "_batch_size", "_is_transactional",
                  "_producer_id", "_producer_epoch", "_base_sequence",
-                 "_first_timestamp", "_max_timestamp", "_last_offset", "_num_records",
-                 "_buffer")
+                 "_first_timestamp", "_max_timestamp", "_base_offset",
+                 "_last_offset", "_num_records", "_buffer", "_timestamp_type")
 
     def __init__(
             self, magic, compression_type, is_transactional,
-            producer_id, producer_epoch, base_sequence, batch_size):
+            producer_id, producer_epoch, base_sequence, batch_size,
+            timestamp_type=0):
         assert magic >= 2
         self._magic = magic
         self._compression_type = compression_type & self.CODEC_MASK
         self._batch_size = batch_size
         self._is_transactional = bool(is_transactional)
+        if timestamp_type not in (self.CREATE_TIME, self.LOG_APPEND_TIME):
+            raise ValueError("Invalid timestamp type: {}".format(timestamp_type))
+        self._timestamp_type = timestamp_type
         # KIP-98 fields for EOS
         self._producer_id = producer_id
         self._producer_epoch = producer_epoch
@@ -505,10 +509,32 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
 
         self._first_timestamp = None
         self._max_timestamp = None
+        self._base_offset = 0
         self._last_offset = 0
         self._num_records = 0
 
         self._buffer = bytearray(self.HEADER_STRUCT.size)
+
+    def set_batch_coordinates(self, base_offset, last_offset):
+        """ Preserve batch coordinates when rebuilding a batch that contains
+            offset holes from compaction.
+        """
+        self._base_offset = base_offset
+        self._last_offset = last_offset
+
+    def override_last_offset(self, last_offset):
+        """ Preserve the last offset of the original batch even if the last
+            record was removed by compaction.
+        """
+        self._last_offset = last_offset
+
+    def override_timestamps(self, first_timestamp=None, max_timestamp=None):
+        """ Preserve batch-level timestamps while rebuilding records.
+        """
+        if first_timestamp is not None:
+            self._first_timestamp = first_timestamp
+        if max_timestamp is not None:
+            self._max_timestamp = max_timestamp
 
     def set_producer_state(self, producer_id, producer_epoch, base_sequence, is_transactional):
         assert not is_transactional or producer_id != -1, "Cannot write transactional messages without a valid producer ID"
@@ -535,7 +561,8 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
         attrs = 0
         if include_compression_type:
             attrs |= self._compression_type
-        # Timestamp Type is set by Broker
+        if self._timestamp_type == self.LOG_APPEND_TIME:
+            attrs |= self.TIMESTAMP_TYPE_MASK
         if self._is_transactional:
             attrs |= self.TRANSACTIONAL_MASK
         # Control batches are only created by Broker
@@ -564,6 +591,12 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
             raise TypeError(
                 "Not supported type for value: {}".format(type(value)))
 
+        offset_delta = offset - self._base_offset
+        if offset_delta < 0:
+            raise ValueError(
+                "Record offset {} precedes batch base offset {}".format(
+                    offset, self._base_offset))
+
         # We will always add the first message, so those will be set
         if self._first_timestamp is None:
             self._first_timestamp = timestamp
@@ -581,8 +614,7 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
         write = message_buffer.extend
 
         encode_varint(timestamp_delta, write_byte)
-        # Base offset is always 0 on Produce
-        encode_varint(offset, write_byte)
+        encode_varint(offset_delta, write_byte)
 
         if key is not None:
             encode_varint(len_func(key), write_byte)
@@ -630,15 +662,16 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
 
     def write_header(self, use_compression_type=True):
         batch_len = len(self._buffer)
+        last_offset_delta = self._last_offset - self._base_offset
         self.HEADER_STRUCT.pack_into(
             self._buffer, 0,
-            0,  # BaseOffset, set by broker
+            self._base_offset,
             batch_len - self.AFTER_LEN_OFFSET,  # Size from here to end
             0,  # PartitionLeaderEpoch, set by broker
             self._magic,
             0,  # CRC will be set below, as we need a filled buffer for it
             self._get_attributes(use_compression_type),
-            self._last_offset,
+            last_offset_delta,
             self._first_timestamp or 0,
             self._max_timestamp or 0,
             self._producer_id,
@@ -651,7 +684,7 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
         crc = calc_crc32c(memoryview(self._buffer)[self.ATTRIBUTES_OFFSET:])
         struct.pack_into(">I", self._buffer, self.CRC_OFFSET, crc)
 
-    def _maybe_compress(self):
+    def _maybe_compress(self, force_compression=False):
         if self._compression_type != self.CODEC_NONE:
             self._assert_has_codec(self._compression_type)
             header_size = self.HEADER_STRUCT.size
@@ -665,7 +698,7 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
             elif self._compression_type == self.CODEC_ZSTD:
                 compressed = zstd_encode(data)
             compressed_size = len(compressed)  # pylint: disable=E0606
-            if len(data) <= compressed_size:
+            if not force_compression and len(data) <= compressed_size:
                 # We did not get any benefit from compression, lets send
                 # uncompressed
                 return False
@@ -677,8 +710,8 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
                 return True
         return False
 
-    def build(self):
-        send_compressed = self._maybe_compress()
+    def build(self, force_compression=False):
+        send_compressed = self._maybe_compress(force_compression)
         self.write_header(send_compressed)
         return self._buffer
 
@@ -744,7 +777,8 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
             " first_timestamp={}, max_timestamp={},"
             " is_transactional={}, producer_id={}, producer_epoch={}, base_sequence={},"
             " records_count={})".format(
-                self._magic, 0, self._last_offset,
+                self._magic, self._base_offset,
+                self._last_offset - self._base_offset,
                 self._first_timestamp or 0, self._max_timestamp or 0,
                 self._is_transactional, self._producer_id, self._producer_epoch, self._base_sequence,
                 self._num_records))
