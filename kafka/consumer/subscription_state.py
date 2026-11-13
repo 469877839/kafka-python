@@ -73,7 +73,30 @@ class SubscriptionState:
         self.assignment = OrderedDict()
         self.rebalance_listener = None
         self.listeners = []
+        self.assignment_listeners = []
         self._lock = threading.RLock()
+
+    def add_assignment_listener(self, listener):
+        """Register a listener for assignment and position changes.
+
+        The listener may implement any of:
+            on_partitions_assigned(partitions)
+            on_partitions_revoked(partitions)
+            on_position_reset(partition)
+
+        These callbacks fire for both manual assignment and
+        coordinator-driven rebalances, as well as for seek()/offset
+        resets (position resets). They are invoked while holding the
+        subscription lock, so implementations must not call back into
+        SubscriptionState.
+        """
+        self.assignment_listeners.append(listener)
+
+    def _notify_assignment(self, callback_name, *args):
+        for listener in self.assignment_listeners:
+            callback = getattr(listener, callback_name, None)
+            if callback is not None:
+                callback(*args)
 
     def _set_subscription_type(self, subscription_type):
         if not isinstance(subscription_type, SubscriptionType):
@@ -287,9 +310,11 @@ class SubscriptionState:
         new_set = set(partitions)
         # Drop revoked partitions (we mutate self.assignment, so list()
         # the keys first to avoid "dict changed size during iteration").
+        revoked = []
         for tp in list(self.assignment.keys()):
             if tp not in new_set:
                 del self.assignment[tp]
+                revoked.append(tp)
             else:
                 # Retained partitions are no longer pending_revocation
                 self.assignment[tp].mark_pending_revocation(False)
@@ -301,10 +326,17 @@ class SubscriptionState:
             random.shuffle(new_partitions)
         for tp in new_partitions:
             self.assignment[tp] = TopicPartitionState()
+        if revoked:
+            self._notify_assignment('on_partitions_revoked', revoked)
+        if new_partitions:
+            self._notify_assignment('on_partitions_assigned', new_partitions)
 
     @synchronized
     def unsubscribe(self):
         """Clear all topic subscriptions and partition assignments"""
+        if self.assignment:
+            self._notify_assignment('on_partitions_revoked',
+                                    list(self.assignment.keys()))
         self.subscription = None
         self._user_assignment.clear()
         self.assignment.clear()
@@ -344,6 +376,7 @@ class SubscriptionState:
         if not isinstance(offset, (int, OffsetAndMetadata)):
             raise TypeError("offset must be type in or OffsetAndMetadata")
         self.assignment[partition].seek(offset)
+        self._notify_assignment('on_position_reset', partition)
 
     @synchronized
     def assigned_partitions(self):

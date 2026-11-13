@@ -9,6 +9,7 @@ import kafka.errors as Errors
 from kafka.errors import KafkaConfigurationError, UnsupportedVersionError
 
 from kafka.consumer.fetcher import Fetcher
+from kafka.consumer.completion import ProcessingCompletionTracker
 from kafka.consumer.subscription_state import SubscriptionState
 from kafka.coordinator.consumer import ConsumerCoordinator
 from kafka.coordinator.assignors.range import RangePartitionAssignor
@@ -142,6 +143,24 @@ class KafkaConsumer:
             other value will raise the exception. Default: 'latest'.
         enable_auto_commit (bool): If True , the consumer's offset will be
             periodically committed in the background. Default: True.
+        enable_processing_completion (bool): If True, enable the explicit
+            processing-completion mode: records handed to the application
+            are tracked per partition, and commits (manual via
+            :meth:`~kafka.KafkaConsumer.commit` /
+            :meth:`~kafka.KafkaConsumer.commit_async` without explicit
+            offsets, as well as auto-commits) only advance to the highest
+            position for which every *delivered* record below it was
+            marked completed via
+            :meth:`~kafka.KafkaConsumer.complete`. This is intended for
+            applications that process records from a partition in
+            parallel, where records complete out of order. Offsets that
+            were never delivered (log-compaction gaps, transaction
+            control records) are skipped automatically -- the consumer
+            never waits for them. Note this does NOT provide exactly-once
+            semantics across external systems (e.g. a database): after a
+            crash or rebalance, records between the committed offset and
+            the last completed offset are redelivered, so processing must
+            be idempotent. Default: False.
         auto_commit_interval_ms (int): Number of milliseconds between automatic
             offset commits, if enable_auto_commit is True. Default: 5000.
         default_offset_commit_callback (callable): Called as
@@ -343,6 +362,7 @@ class KafkaConsumer:
         'max_in_flight_requests_per_connection': 5,
         'auto_offset_reset': 'latest',
         'enable_auto_commit': True,
+        'enable_processing_completion': False,
         'auto_commit_interval_ms': 5000,
         'default_offset_commit_callback': lambda offsets, response: True,
         'check_crcs': True,
@@ -499,6 +519,11 @@ class KafkaConsumer:
             self._client, self._subscription, metrics=self._metrics,
             assignors=self.config['partition_assignment_strategy'],
             **self.config)
+        self._completion_tracker = None
+        if self.config['enable_processing_completion']:
+            self._completion_tracker = ProcessingCompletionTracker()
+            self._subscription.add_assignment_listener(self._completion_tracker)
+            self._coordinator.set_completion_tracker(self._completion_tracker)
         self._closed = False
         self._iterator = None
         self._consumer_timeout = float('inf')
@@ -676,7 +701,7 @@ class KafkaConsumer:
         if self.config['group_id'] is None:
             raise Errors.IllegalStateError('Requires group_id')
         if offsets is None:
-            offsets = self._subscription.all_consumed_offsets()
+            offsets = self._offsets_to_commit()
         log.debug("Committing offsets: %s", offsets)
         future = self._coordinator.commit_offsets_async(
             offsets, callback=callback)
@@ -717,8 +742,69 @@ class KafkaConsumer:
         if self.config['group_id'] is None:
             raise Errors.IllegalStateError('Requires group_id')
         if offsets is None:
-            offsets = self._subscription.all_consumed_offsets()
+            offsets = self._offsets_to_commit()
         self._coordinator.commit_offsets_sync(offsets, timeout_ms=timeout_ms)
+
+    def _offsets_to_commit(self):
+        """Offsets to commit when the caller did not pass explicit offsets.
+
+        With enable_processing_completion, this is the per-partition
+        position computed from processing completions; otherwise the
+        consumed positions.
+        """
+        if self._completion_tracker is not None:
+            return self._completion_tracker.committable_offsets(self._subscription)
+        return self._subscription.all_consumed_offsets()
+
+    def complete(self, record_or_partition, offset=None):
+        """Mark a delivered record as fully processed.
+
+        Only valid when enable_processing_completion is True. Completed
+        records allow the partition's committable position to advance
+        past them; completions may arrive out of order and duplicates
+        are ignored. Completions for records delivered under a previous
+        assignment (before a seek, rebalance revocation, or
+        re-assignment) do not advance the current assignment's state.
+
+        Arguments:
+            record_or_partition: a ConsumerRecord as returned by
+                poll()/iteration, or a TopicPartition.
+            offset (int, optional): the record offset; required when the
+                first argument is a TopicPartition.
+
+        Returns:
+            bool: True if a pending record was cleared, False if the
+            completion was a duplicate or referred to an offset that is
+            not pending in the current assignment.
+        """
+        if self._completion_tracker is None:
+            raise Errors.IllegalStateError(
+                'complete() requires enable_processing_completion=True')
+        if isinstance(record_or_partition, TopicPartition):
+            tp = record_or_partition
+            if not isinstance(offset, int):
+                raise TypeError('offset must be an int when completing by'
+                                ' TopicPartition')
+        else:
+            record = record_or_partition
+            tp = TopicPartition(record.topic, record.partition)
+            offset = record.offset
+        return self._completion_tracker.complete(tp, offset)
+
+    def committable_offsets(self):
+        """Current per-partition positions committable under
+        enable_processing_completion.
+
+        Returns:
+            dict: {TopicPartition: OffsetAndMetadata} -- for each
+            assigned partition, the smallest delivered-but-uncompleted
+            offset, or the fetch position when nothing is pending.
+        """
+        if self._completion_tracker is None:
+            raise Errors.IllegalStateError(
+                'committable_offsets() requires'
+                ' enable_processing_completion=True')
+        return self._completion_tracker.committable_offsets(self._subscription)
 
     def group_metadata(self):
         """Return a snapshot of this consumer's group membership.
@@ -889,6 +975,13 @@ class KafkaConsumer:
         while not self._closed:
             records = self._poll_once(timer, max_records, update_offsets=update_offsets)
             if records:
+                # update_offsets=False means an internal call from the
+                # iterator interface; those records are registered by
+                # _message_generator_v2 as they are actually yielded.
+                if self._completion_tracker is not None and update_offsets:
+                    for tp, tp_records in records.items():
+                        for record in tp_records:
+                            self._completion_tracker.note_delivered(tp, record.offset)
                 return records
             elif timer.expired:
                 break
@@ -1077,6 +1170,8 @@ class KafkaConsumer:
             raise ValueError('Unassigned partition')
         log.debug("Seeking to offset %s for partition %s", offset, partition)
         self._subscription.assignment[partition].seek(offset)
+        if self._completion_tracker is not None:
+            self._completion_tracker.on_position_reset(partition)
         self._iterator = None
 
     def seek_to_beginning(self, *partitions):
@@ -1405,6 +1500,8 @@ class KafkaConsumer:
                     break
                 self._subscription.assignment[tp].position = OffsetAndMetadata(
                     record.offset + 1, '', record.leader_epoch)
+                if self._completion_tracker is not None:
+                    self._completion_tracker.note_delivered(tp, record.offset)
                 yield record
 
     def __iter__(self):  # pylint: disable=non-iterator-returned

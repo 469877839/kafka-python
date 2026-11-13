@@ -1,3 +1,14 @@
+# Unreleased
+
+### Features
+* Consumer: add explicit processing-completion mode (`enable_processing_completion`)
+  for parallel/out-of-order record processing. Delivered records are tracked per
+  partition and commits (manual and auto) only advance to the highest position
+  whose delivered records all completed via `KafkaConsumer.complete()`.
+  Undelivered offsets (compaction gaps, control records) are skipped; seeks,
+  revocations and re-assignments reset per-partition state so stale completions
+  cannot advance a new assignment. Does not provide cross-system exactly-once.
+
 # 3.0.13 (Nov 5, 2026)
 
 ### Fixes

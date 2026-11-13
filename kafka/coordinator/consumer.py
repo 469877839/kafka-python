@@ -76,6 +76,7 @@ class ConsumerCoordinator(BaseCoordinator):
             raise Errors.KafkaConfigurationError('Unrecognized isolation_level') from None
 
         self._subscription = subscription
+        self._completion_tracker = None
         self._is_leader = False
         self._rebalance_protocol = None
         self._joined_subscription = set()
@@ -129,6 +130,21 @@ class ConsumerCoordinator(BaseCoordinator):
         self._rebalance_protocol = self._validate_rebalance_protocol()
         self._cluster.request_update()
         self._cluster.add_listener(WeakMethod(self._handle_metadata_update))
+
+    def set_completion_tracker(self, tracker):
+        """Attach a ProcessingCompletionTracker (or None to detach).
+
+        When attached, commits that don't specify explicit offsets --
+        auto-commits and the pre-rebalance commit -- use the tracker's
+        per-partition committable positions instead of the consumed
+        positions.
+        """
+        self._completion_tracker = tracker
+
+    def _offsets_to_commit(self):
+        if self._completion_tracker is not None:
+            return self._completion_tracker.committable_offsets(self._subscription)
+        return self._subscription.all_consumed_offsets()
 
     def _validate_rebalance_protocol(self):
         """Return the single :class:`RebalanceProtocol` mode that all
@@ -519,7 +535,7 @@ class ConsumerCoordinator(BaseCoordinator):
         if self.config['enable_auto_commit']:
             try:
                 await self._commit_offsets_sync_async(
-                    self._subscription.all_consumed_offsets(),
+                    self._offsets_to_commit(),
                     timeout_ms=timeout_ms)
             except (Errors.UnknownMemberIdError,
                     Errors.IllegalGenerationError,
@@ -871,7 +887,7 @@ class ConsumerCoordinator(BaseCoordinator):
     def _maybe_auto_commit_offsets_sync(self, timeout_ms=None):
         if self.config['enable_auto_commit']:
             try:
-                self.commit_offsets_sync(self._subscription.all_consumed_offsets(), timeout_ms=timeout_ms)
+                self.commit_offsets_sync(self._offsets_to_commit(), timeout_ms=timeout_ms)
 
             # The three main group membership errors are known and should not
             # require a stacktrace -- just a warning
@@ -1199,7 +1215,7 @@ class ConsumerCoordinator(BaseCoordinator):
             self._do_auto_commit_offsets_async()
 
     def _do_auto_commit_offsets_async(self):
-        self.commit_offsets_async(self._subscription.all_consumed_offsets(),
+        self.commit_offsets_async(self._offsets_to_commit(),
                                   self._commit_offsets_async_on_complete)
 
 
