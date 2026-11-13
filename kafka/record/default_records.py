@@ -60,12 +60,56 @@ from kafka.record.abc import ABCRecord, ABCRecordBatch, ABCRecordBatchBuilder
 from kafka.record.util import (
     decode_varint, encode_varint, calc_crc32c, size_of_varint
 )
-from kafka.errors import CorruptRecordError, UnsupportedCodecError
+from kafka.errors import (
+    CorruptRecordError,
+    DecompressionBytesLimitError,
+    RecordCountLimitError,
+    RecordTruncatedError,
+    UnsupportedCodecError,
+    UnsupportedRecordLimitsError,
+)
 from kafka.codec import (
     gzip_encode, snappy_encode, lz4_encode, zstd_encode,
     gzip_decode, snappy_decode, lz4_decode, zstd_decode
 )
 import kafka.codec as codecs
+
+
+_DECOMPRESSED_BYTES_LIMIT_ALIASES = (
+    "max_decompressed_size",
+    "max_uncompressed_bytes",
+    "max_uncompressed_size",
+    "max_decompression_size",
+    "max_decompress_bytes",
+    "decompressed_bytes_limit",
+)
+_RECORD_COUNT_LIMIT_ALIASES = (
+    "max_record_count",
+    "max_records_per_batch",
+    "record_count_limit",
+)
+
+
+def _resolve_limit(canonical, value, aliases, kwargs):
+    found = []
+    if value is not None:
+        found.append((canonical, value))
+    for alias in aliases:
+        if alias in kwargs:
+            found.append((alias, kwargs.pop(alias)))
+    if not found:
+        return None
+    first_name, limit = found[0]
+    for name, other in found[1:]:
+        if other != limit:
+            raise TypeError(
+                "Conflicting {} values: {}={!r} and {}={!r}".format(
+                    canonical, first_name, limit, name, other))
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        raise TypeError("{} must be an integer or None".format(canonical))
+    if limit < 0:
+        raise ValueError("{} must be non-negative".format(canonical))
+    return limit
 
 
 class DefaultRecordBase:
@@ -127,15 +171,28 @@ class DefaultRecordBase:
 class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
     __slots__ = ("_buffer", "_header_data", "_pos", "_num_records",
-                 "_next_record_index", "_decompressed")
+                 "_next_record_index", "_decompressed",
+                 "_max_decompressed_bytes", "_max_records",
+                 "_decompressed_bytes")
 
-    def __init__(self, buffer):
+    def __init__(self, buffer, max_decompressed_bytes=None, max_records=None,
+                 **kwargs):
+        self._max_decompressed_bytes = _resolve_limit(
+            "max_decompressed_bytes", max_decompressed_bytes,
+            _DECOMPRESSED_BYTES_LIMIT_ALIASES, kwargs)
+        self._max_records = _resolve_limit(
+            "max_records", max_records, _RECORD_COUNT_LIMIT_ALIASES, kwargs)
+        if kwargs:
+            raise TypeError(
+                "Unexpected keyword arguments: {}".format(
+                    ", ".join(sorted(kwargs))))
         self._buffer = bytearray(buffer)
         self._header_data = self.HEADER_STRUCT.unpack_from(self._buffer)
         self._pos = self.HEADER_STRUCT.size
         self._num_records = self._header_data[12]
         self._next_record_index = 0
         self._decompressed = False
+        self._decompressed_bytes = None
 
     @property
     def base_offset(self):
@@ -231,23 +288,110 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
     def records_count(self):
         return self._header_data[12]
 
+    @property
+    def decompressed_bytes(self):
+        """Number of record payload bytes produced by decompression.
+
+        This is ``None`` until the batch has been iterated. For an
+        uncompressed batch it is the size of the record payload.
+        """
+        return self._decompressed_bytes
+
+    @property
+    def decompressed_size(self):
+        return self._decompressed_bytes
+
+    @property
+    def max_decompressed_bytes(self):
+        return self._max_decompressed_bytes
+
+    @property
+    def max_records(self):
+        return self._max_records
+
     def _maybe_uncompress(self):
         if not self._decompressed:
+            if (self._max_records is not None
+                    and self._num_records > self._max_records):
+                raise RecordCountLimitError(
+                    "Record batch declares {} records, which exceeds "
+                    "max_records ({})".format(
+                        self._num_records, self._max_records),
+                    limit=self._max_records, actual=self._num_records,
+                    kind="records")
+
             compression_type = self.compression_type
             if compression_type != self.CODEC_NONE:
                 self._assert_has_codec(compression_type)
                 data = memoryview(self._buffer)[self._pos:]
                 if compression_type == self.CODEC_GZIP:
-                    uncompressed = gzip_decode(data)
+                    if self._max_decompressed_bytes is None:
+                        uncompressed = gzip_decode(data)
+                    else:
+                        try:
+                            uncompressed = gzip_decode(
+                                data,
+                                max_output_size=self._max_decompressed_bytes)
+                        except DecompressionBytesLimitError as err:
+                            self._decompressed_bytes = err.actual
+                            raise
+                        if (len(uncompressed)
+                                > self._max_decompressed_bytes):
+                            self._decompressed_bytes = len(uncompressed)
+                            raise DecompressionBytesLimitError(
+                                "Decompressed record batch exceeds "
+                                "max_decompressed_bytes ({} > {})".format(
+                                    len(uncompressed),
+                                    self._max_decompressed_bytes),
+                                limit=self._max_decompressed_bytes,
+                                actual=len(uncompressed), kind="bytes")
                 if compression_type == self.CODEC_SNAPPY:
+                    if self._max_decompressed_bytes is not None:
+                        raise UnsupportedRecordLimitsError(
+                            "Decompressed byte limits are not supported for "
+                            "the snappy codec; only uncompressed and gzip "
+                            "record batches support incremental limits")
                     uncompressed = snappy_decode(data.tobytes())
                 if compression_type == self.CODEC_LZ4:
+                    if self._max_decompressed_bytes is not None:
+                        raise UnsupportedRecordLimitsError(
+                            "Decompressed byte limits are not supported for "
+                            "the lz4 codec; only uncompressed and gzip "
+                            "record batches support incremental limits")
                     uncompressed = lz4_decode(data.tobytes())
                 if compression_type == self.CODEC_ZSTD:
+                    if self._max_decompressed_bytes is not None:
+                        raise UnsupportedRecordLimitsError(
+                            "Decompressed byte limits are not supported for "
+                            "the zstd codec; only uncompressed and gzip "
+                            "record batches support incremental limits")
                     uncompressed = zstd_decode(data.tobytes())
                 self._buffer = bytearray(uncompressed)  # pylint: disable=E0606
                 self._pos = 0
+                self._decompressed_bytes = len(uncompressed)
+            else:
+                payload_size = len(self._buffer) - self._pos
+                if (self._max_decompressed_bytes is not None
+                        and payload_size > self._max_decompressed_bytes):
+                    self._decompressed_bytes = payload_size
+                    raise DecompressionBytesLimitError(
+                        "Uncompressed record batch payload exceeds "
+                        "max_decompressed_bytes ({} > {})".format(
+                            payload_size, self._max_decompressed_bytes),
+                        limit=self._max_decompressed_bytes,
+                        actual=payload_size, kind="bytes")
+                self._decompressed_bytes = payload_size
         self._decompressed = True
+
+    def _check_record_bound(self, pos, size, record_end, field_name):
+        if size < 0:
+            raise CorruptRecordError(
+                "Invalid negative {} size {}".format(field_name, size))
+        if pos + size > record_end:
+            raise RecordTruncatedError(
+                "Record batch truncated while reading {}: need {} bytes at "
+                "offset {}, record ends at {}".format(
+                    field_name, size, pos, record_end))
 
     def _read_msg(
             self,
@@ -266,7 +410,16 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
         buffer = self._buffer
         pos = self._pos
         length, pos = decode_varint(buffer, pos)
+        if length < 0:
+            raise CorruptRecordError(
+                "Invalid negative record size {}".format(length))
         start_pos = pos
+        record_end = start_pos + length
+        if record_end > len(buffer):
+            raise RecordTruncatedError(
+                "Record batch truncated: record at offset {} declares {} "
+                "bytes but only {} remain".format(
+                    self._pos, length, len(buffer) - start_pos))
         _, pos = decode_varint(buffer, pos)  # attrs can be skipped for now
 
         ts_delta, pos = decode_varint(buffer, pos)
@@ -280,6 +433,7 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
         key_len, pos = decode_varint(buffer, pos)
         if key_len >= 0:
+            self._check_record_bound(pos, key_len, record_end, "key")
             key = bytes(buffer[pos: pos + key_len])
             pos += key_len
         else:
@@ -287,6 +441,7 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
         value_len, pos = decode_varint(buffer, pos)
         if value_len >= 0:
+            self._check_record_bound(pos, value_len, record_end, "value")
             value = bytes(buffer[pos: pos + value_len])
             pos += value_len
         else:
@@ -303,12 +458,15 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
             if h_key_len < 0:
                 raise CorruptRecordError(
                     "Invalid negative header key size {}".format(h_key_len))
+            self._check_record_bound(pos, h_key_len, record_end, "header key")
             h_key = buffer[pos: pos + h_key_len].decode("utf-8")
             pos += h_key_len
 
             # Value is of type NULLABLE_BYTES, so it can be None
             h_value_len, pos = decode_varint(buffer, pos)
             if h_value_len >= 0:
+                self._check_record_bound(
+                    pos, h_value_len, record_end, "header value")
                 h_value = bytes(buffer[pos: pos + h_value_len])
                 pos += h_value_len
             else:
@@ -344,7 +502,10 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
             raise StopIteration
         try:
             msg = self._read_msg()
-        except (ValueError, IndexError) as err:
+        except IndexError as err:
+            raise RecordTruncatedError(
+                "Record batch truncated: {!r}".format(err))
+        except ValueError as err:
             raise CorruptRecordError(
                 "Found invalid record structure: {!r}".format(err))
         else:

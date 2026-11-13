@@ -2,6 +2,16 @@ import gzip
 import io
 import platform
 import struct
+import sys
+import zlib
+
+from kafka.errors import (
+    CorruptRecordError,
+    DecompressionBytesLimitError,
+    RecordCRCError,
+    RecordTruncatedError,
+    UnsupportedRecordLimitsError,
+)
 
 
 _XERIAL_V1_HEADER = (-126, b'S', b'N', b'A', b'P', b'P', b'Y', 0, 1, 1)
@@ -91,7 +101,89 @@ def gzip_encode(payload, compresslevel=None):
     return buf.getvalue()
 
 
-def gzip_decode(payload):
+def _gzip_decode_limited(payload, max_output_size):
+    """Decompress gzip data without ever buffering more than the limit.
+
+    ``zlib.decompressobj`` accepts a maximum output length per call, which
+    lets us stop after ``max_output_size + 1`` bytes and reject the batch
+    before a high-ratio payload can consume unbounded memory.
+    """
+    if max_output_size < 0:
+        raise ValueError("max_output_size must be non-negative")
+
+    uncompressed = bytearray()
+    pending = bytes(payload)
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+
+    while True:
+        # Ask for one byte past the limit so we can distinguish "exactly at
+        # the limit" from "the stream contains more data".
+        want = max_output_size - len(uncompressed) + 1
+        if want > sys.maxsize:
+            want = sys.maxsize
+        try:
+            chunk = decompressor.decompress(pending, want)
+        except zlib.error as err:
+            message = str(err)
+            if "incorrect data check" in message:
+                raise RecordCRCError(
+                    "gzip stream failed its CRC check: {}".format(message))
+            raise CorruptRecordError(
+                "Invalid gzip stream: {}".format(message))
+        uncompressed.extend(chunk)
+        if len(uncompressed) > max_output_size:
+            raise DecompressionBytesLimitError(
+                "Decompressed record batch exceeds max_decompressed_bytes "
+                "({} > {})".format(len(uncompressed), max_output_size),
+                limit=max_output_size, actual=len(uncompressed), kind="bytes")
+
+        pending = decompressor.unconsumed_tail
+        if pending:
+            continue
+
+        if decompressor.eof:
+            trailing = decompressor.unused_data
+            if not trailing:
+                return bytes(uncompressed)
+            # gzip.GzipFile supports concatenated members and ignores zero
+            # padding. Match that behavior for compatibility.
+            if not trailing.strip(b"\x00"):
+                return bytes(uncompressed)
+            if len(trailing) >= 2 and trailing[:2] == b"\x1f\x8b":
+                pending = trailing
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                continue
+            raise CorruptRecordError(
+                "Invalid gzip stream: trailing data after gzip member")
+
+        # All input was consumed but the end-of-stream marker was not seen.
+        if not pending:
+            raise RecordTruncatedError(
+                "Truncated gzip stream: end-of-stream marker not found")
+
+
+def gzip_decode(payload, max_output_size=None, **kwargs):
+    alias_values = []
+    for name in ("max_decompressed_bytes", "max_decompressed_size",
+                 "max_bytes", "limit"):
+        if name in kwargs:
+            alias_values.append((name, kwargs.pop(name)))
+    if max_output_size is not None:
+        alias_values.insert(0, ("max_output_size", max_output_size))
+    if kwargs:
+        raise TypeError(
+            "Unexpected keyword arguments: {}".format(
+                ", ".join(sorted(kwargs))))
+    if alias_values:
+        first_name, max_output_size = alias_values[0]
+        for name, value in alias_values[1:]:
+            if value != max_output_size:
+                raise TypeError(
+                    "Conflicting gzip output limits: {}={!r}, {}={!r}".format(
+                        first_name, max_output_size, name, value))
+    if max_output_size is not None:
+        return _gzip_decode_limited(payload, max_output_size)
+
     buf = io.BytesIO(payload)
 
     # Gzip context manager introduced in python 2.7
@@ -197,9 +289,18 @@ def _detect_xerial_stream(payload):
     return False
 
 
-def snappy_decode(payload):
+def _reject_limited_decode(codec_name, max_output_size):
+    if max_output_size is not None:
+        raise UnsupportedRecordLimitsError(
+            "Decompressed byte limits are not supported for the {} codec; "
+            "only uncompressed and gzip record batches support incremental "
+            "limits".format(codec_name))
+
+
+def snappy_decode(payload, max_output_size=None):
     if not has_snappy():
         raise NotImplementedError("Snappy codec is not available")
+    _reject_limited_decode("snappy", max_output_size)
 
     if _detect_xerial_stream(payload):
         # TODO ? Should become a fileobj ?
@@ -247,13 +348,20 @@ def lz4f_decode(payload):
 
 
 if lz4:
-    lz4_decode = lz4.decompress # pylint: disable-msg=no-member
+    _lz4_decode = lz4.decompress # pylint: disable-msg=no-member
 elif lz4f:
-    lz4_decode = lz4f_decode
+    _lz4_decode = lz4f_decode
 elif lz4framed:
-    lz4_decode = lz4framed.decompress # pylint: disable-msg=no-member
+    _lz4_decode = lz4framed.decompress # pylint: disable-msg=no-member
 else:
-    lz4_decode = None
+    _lz4_decode = None
+
+
+def lz4_decode(payload, max_output_size=None):
+    _reject_limited_decode("lz4", max_output_size)
+    if _lz4_decode is None:
+        raise NotImplementedError("LZ4 codec is not available")
+    return _lz4_decode(payload)
 
 
 def lz4_encode_old_kafka(payload):
@@ -288,9 +396,10 @@ def lz4_encode_old_kafka(payload):
     ])
 
 
-def lz4_decode_old_kafka(payload):
+def lz4_decode_old_kafka(payload, max_output_size=None):
     if xxhash is None:
         raise RuntimeError('pip install xxhash for lz4 encoding with 0.8/0.9 brokers')
+    _reject_limited_decode("lz4", max_output_size)
     # Kafka's LZ4 code has a bug in its header checksum implementation
     header_size = 7
     if isinstance(payload[4], int):
@@ -318,8 +427,9 @@ def zstd_encode(payload):
     return zstd.ZstdCompressor().compress(payload)
 
 
-def zstd_decode(payload):
+def zstd_decode(payload, max_output_size=None):
     if not zstd:
         raise NotImplementedError("Zstd codec is not available")
+    _reject_limited_decode("zstd", max_output_size)
     with zstd.ZstdDecompressor().stream_reader(io.BytesIO(payload), read_across_frames=True) as reader:
         return reader.read()

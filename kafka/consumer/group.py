@@ -168,6 +168,12 @@ class KafkaConsumer:
             Default: [RangePartitionAssignor, RoundRobinPartitionAssignor]
         max_poll_records (int): The maximum number of records returned in a
             single call to :meth:`~kafka.KafkaConsumer.poll`. Default: 500
+        max_decompressed_bytes (int): Optional cap on the number of bytes a
+            single record batch may decompress to. When set, batches using
+            codecs without incremental decoding support are rejected rather
+            than decompressed without a bound. Default: None (unbounded).
+        max_records_per_batch (int): Optional cap on the number of records a
+            single batch may declare. Default: None (unbounded).
         max_poll_interval_ms (int): The maximum delay between invocations of
             :meth:`~kafka.KafkaConsumer.poll` when using consumer group
             management. This places an upper bound on the amount of time that
@@ -352,6 +358,11 @@ class KafkaConsumer:
         'client_dns_lookup': 'use_all_dns_ips',
         'partition_assignment_strategy': (RangePartitionAssignor, RoundRobinPartitionAssignor),
         'max_poll_records': 500,
+        'max_decompressed_bytes': None,
+        'max_decompressed_size': None,
+        'max_records_per_batch': None,
+        'max_record_count': None,
+        'max_records': None,
         'max_poll_interval_ms': 300000,
         'session_timeout_ms': 45000,
         'heartbeat_interval_ms': 3000,

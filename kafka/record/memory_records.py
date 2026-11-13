@@ -21,10 +21,20 @@
 
 import struct
 
-from kafka.errors import CorruptRecordError, IllegalStateError, UnsupportedVersionError
+from kafka.errors import (
+    CorruptRecordError,
+    IllegalStateError,
+    UnsupportedVersionError,
+)
 from kafka.record.abc import ABCRecords
 from kafka.record.legacy_records import LegacyRecordBatch, LegacyRecordBatchBuilder
-from kafka.record.default_records import DefaultRecordBatch, DefaultRecordBatchBuilder
+from kafka.record.default_records import (
+    DefaultRecordBatch,
+    DefaultRecordBatchBuilder,
+    _DECOMPRESSED_BYTES_LIMIT_ALIASES,
+    _RECORD_COUNT_LIMIT_ALIASES,
+    _resolve_limit,
+)
 
 
 class MemoryRecords(ABCRecords):
@@ -36,9 +46,20 @@ class MemoryRecords(ABCRecords):
     # Minimum space requirements for Record V0
     MIN_SLICE = LOG_OVERHEAD + LegacyRecordBatch.RECORD_OVERHEAD_V0
 
-    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes")
+    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes",
+                 "_max_decompressed_bytes", "_max_records")
 
-    def __init__(self, bytes_data):
+    def __init__(self, bytes_data, max_decompressed_bytes=None,
+                 max_records=None, **kwargs):
+        self._max_decompressed_bytes = _resolve_limit(
+            "max_decompressed_bytes", max_decompressed_bytes,
+            _DECOMPRESSED_BYTES_LIMIT_ALIASES, kwargs)
+        self._max_records = _resolve_limit(
+            "max_records", max_records, _RECORD_COUNT_LIMIT_ALIASES, kwargs)
+        if kwargs:
+            raise TypeError(
+                "Unexpected keyword arguments: {}".format(
+                    ", ".join(sorted(kwargs))))
         self._buffer = bytes_data
         self._pos = 0
         # We keep one slice ahead so `has_next` will return very fast
@@ -93,10 +114,34 @@ class MemoryRecords(ABCRecords):
 
     # NOTE: same cache for LOAD_FAST as above
     def next_batch(self, _min_slice=MIN_SLICE,
-                   _magic_offset=MAGIC_OFFSET):
+                   _magic_offset=MAGIC_OFFSET,
+                   max_decompressed_bytes=None, max_records=None,
+                   **kwargs):
         next_slice = self._next_slice
         if next_slice is None:
             return None
+        if kwargs:
+            max_decompressed_bytes = _resolve_limit(
+                "max_decompressed_bytes", max_decompressed_bytes,
+                _DECOMPRESSED_BYTES_LIMIT_ALIASES, kwargs)
+            max_records = _resolve_limit(
+                "max_records", max_records,
+                _RECORD_COUNT_LIMIT_ALIASES, kwargs)
+            if kwargs:
+                raise TypeError(
+                    "Unexpected keyword arguments: {}".format(
+                        ", ".join(sorted(kwargs))))
+        else:
+            if max_decompressed_bytes is not None:
+                max_decompressed_bytes = _resolve_limit(
+                    "max_decompressed_bytes", max_decompressed_bytes, (), {})
+            if max_records is not None:
+                max_records = _resolve_limit(
+                    "max_records", max_records, (), {})
+        if max_decompressed_bytes is None:
+            max_decompressed_bytes = self._max_decompressed_bytes
+        if max_records is None:
+            max_records = self._max_records
         if len(next_slice) < _min_slice:
             raise CorruptRecordError(
                 "Record size is less than the minimum record overhead "
@@ -104,9 +149,15 @@ class MemoryRecords(ABCRecords):
         self._cache_next()
         magic, = struct.unpack_from(">b", next_slice, _magic_offset)
         if magic <= 1:
-            return LegacyRecordBatch(next_slice, magic)
+            return LegacyRecordBatch(
+                next_slice, magic,
+                max_decompressed_bytes=max_decompressed_bytes,
+                max_records=max_records)
         else:
-            return DefaultRecordBatch(next_slice)
+            return DefaultRecordBatch(
+                next_slice,
+                max_decompressed_bytes=max_decompressed_bytes,
+                max_records=max_records)
 
     def __iter__(self):
         return self

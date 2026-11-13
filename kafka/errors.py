@@ -135,6 +135,47 @@ class UnsupportedCodecError(KafkaError):
     pass
 
 
+class UnsupportedRecordLimitsError(UnsupportedCodecError):
+    """The selected record path cannot enforce the requested limits safely."""
+    pass
+
+
+class RecordTooLargeError(KafkaError):
+    """A record or record batch cannot be decoded within configured limits."""
+    pass
+
+
+class DecompressionLimitError(RecordTooLargeError):
+    """Base class for exceeding a configured batch decoding limit.
+
+    The ``limit``, ``actual`` and ``kind`` attributes make the failed limit
+    machine-readable while the message remains useful to human readers.
+    """
+
+    def __init__(self, message, limit=None, actual=None, kind=None):
+        super().__init__(message)
+        self.limit = limit
+        self.actual = actual
+        self.kind = kind
+        self.decompressed_bytes = actual if kind == "bytes" else None
+        self.record_count = actual if kind == "records" else None
+
+
+class DecompressionBytesLimitError(DecompressionLimitError):
+    pass
+
+
+class RecordCountLimitError(DecompressionLimitError):
+    pass
+
+
+# Common aliases used by callers before this limit was standardized.
+DecompressionLimitExceeded = DecompressionLimitError
+DecompressionLimitExceededError = DecompressionLimitError
+DecompressedBytesLimitExceeded = DecompressionBytesLimitError
+RecordCountLimitExceeded = RecordCountLimitError
+
+
 class TransactionAbortedError(KafkaError):
     """Raised on undrained batches when a transaction is aborted with no
     underlying cause -- the user chose to abort (KIP-654). Non-fatal: the
@@ -182,6 +223,22 @@ class CorruptRecordError(BrokerResponseError):
     message = 'CORRUPT_MESSAGE'
     description = ('This message has failed its CRC checksum, exceeds the'
                    ' valid size, or is otherwise corrupt.')
+
+
+class RecordCRCError(CorruptRecordError):
+    """The record batch or codec checksum did not match."""
+    pass
+
+
+class RecordTruncatedError(CorruptRecordError):
+    """The record batch ended before a declared record field was complete."""
+    pass
+
+
+# Descriptive aliases for callers that distinguish checksum failures from
+# truncated input. Both remain CorruptRecordError subclasses for compatibility.
+InvalidRecordCRCError = RecordCRCError
+TruncatedRecordError = RecordTruncatedError
 
 # Backward compatibility
 CorruptRecordException = CorruptRecordError

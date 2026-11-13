@@ -76,8 +76,7 @@ _OffsetForLeaderTopic = OffsetForLeaderEpochRequest.OffsetForLeaderTopic
 _OffsetForLeaderPartition = _OffsetForLeaderTopic.OffsetForLeaderPartition
 
 
-class RecordTooLargeError(Errors.KafkaError):
-    pass
+RecordTooLargeError = Errors.RecordTooLargeError
 
 
 class Fetcher:
@@ -89,6 +88,11 @@ class Fetcher:
         'fetch_max_bytes': 52428800,
         'max_partition_fetch_bytes': 1048576,
         'max_poll_records': sys.maxsize,
+        'max_decompressed_bytes': None,
+        'max_decompressed_size': None,
+        'max_records_per_batch': None,
+        'max_record_count': None,
+        'max_records': None,
         'check_crcs': True,
         'metrics': None,
         'metric_group_prefix': 'consumer',
@@ -137,6 +141,12 @@ class Fetcher:
                 send messages larger than the consumer can fetch. If that
                 happens, the consumer can get stuck trying to fetch a large
                 message on a certain partition. Default: 1048576.
+            max_decompressed_bytes (int): Optional cap on the number of bytes
+                a single compressed record batch may decompress to. Only
+                uncompressed and gzip batches support incremental enforcement;
+                other codecs are rejected when this is set. Default: None.
+            max_records_per_batch (int): Optional cap on the number of records
+                declared by a single batch. Default: None.
             check_crcs (bool): Automatically check the CRC32 of the records
                 consumed. This ensures no on-the-wire or on-disk corruption to
                 the messages occurred. This check adds some overhead, so it may
@@ -149,6 +159,27 @@ class Fetcher:
         for key in self.config:
             if key in configs:
                 self.config[key] = configs[key]
+
+        # Accept descriptive aliases for the decode limits, but keep a single
+        # canonical value so the batch reader never silently ignores one.
+        for canonical, aliases in (
+                ('max_decompressed_bytes', ('max_decompressed_size',)),
+                ('max_records_per_batch',
+                 ('max_record_count', 'max_records'))):
+            values = [
+                (name, self.config[name])
+                for name in (canonical,) + aliases
+                if self.config.get(name) is not None
+            ]
+            if values:
+                first_name, first_value = values[0]
+                for name, value in values[1:]:
+                    if value != first_value:
+                        raise Errors.KafkaConfigurationError(
+                            "Conflicting {} values: {}={!r}, {}={!r}".format(
+                                canonical, first_name, first_value,
+                                name, value))
+                self.config[canonical] = first_value
 
         for key in ('key_deserializer', 'value_deserializer'):
             if self.config[key] is not None and not isinstance(self.config[key], Deserializer):
@@ -1461,7 +1492,11 @@ class Fetcher:
                     self._manager.cluster.request_update()
                     return None
 
-                records = MemoryRecords(completed_fetch.partition_data.records)
+                records = MemoryRecords(
+                    completed_fetch.partition_data.records,
+                    max_decompressed_bytes=self.config.get(
+                        'max_decompressed_bytes'),
+                    max_records=self.config.get('max_records_per_batch'))
                 aborted_transactions = completed_fetch.partition_data.aborted_transactions
                 log.debug("Preparing to read %s bytes of data for partition %s with offset %d",
                           records.size_in_bytes(), tp, fetch_offset)
@@ -1599,7 +1634,9 @@ class Fetcher:
                      check_crcs=True,
                      isolation_level=IsolationLevel.READ_UNCOMMITTED,
                      aborted_transactions=None, # AbortedTransaction data from FetchResponse
-                     metric_aggregator=None, on_drain=lambda x: None):
+                     metric_aggregator=None, on_drain=lambda x: None,
+                     max_decompressed_bytes=None,
+                     max_records_per_batch=None):
             self.fetch_offset = fetch_offset
             self.topic_partition = tp
             self.leader_epoch = -1
@@ -1613,6 +1650,8 @@ class Fetcher:
             )
             self.metric_aggregator = metric_aggregator
             self.check_crcs = check_crcs
+            self.max_decompressed_bytes = max_decompressed_bytes
+            self.max_records_per_batch = max_records_per_batch
             self.record_iterator = itertools.dropwhile(
                 self._maybe_skip_record,
                 self._unpack_records(tp, records, key_deserializer, value_deserializer))
@@ -1663,13 +1702,15 @@ class Fetcher:
 
         def _unpack_records(self, tp, records, key_deserializer, value_deserializer):
             try:
-                batch = records.next_batch()
+                batch = records.next_batch(
+                    max_decompressed_bytes=self.max_decompressed_bytes,
+                    max_records=self.max_records_per_batch)
                 last_batch = None
                 while batch is not None:
                     last_batch = batch
 
                     if self.check_crcs and not batch.validate_crc():
-                        raise Errors.CorruptRecordError(
+                        raise Errors.RecordCRCError(
                                 "Record batch for partition %s at offset %s failed crc check" % (
                                     self.topic_partition, batch.base_offset))
 
@@ -1695,19 +1736,31 @@ class Fetcher:
                                           " offsets %s to %s",
                                           self.topic_partition, producer_id, batch.base_offset, batch.last_offset)
                                 self.next_fetch_offset = batch.next_offset
-                                batch = records.next_batch()
+                                batch = records.next_batch(
+                                    max_decompressed_bytes=self.max_decompressed_bytes,
+                                    max_records=self.max_records_per_batch)
                                 continue
 
                         # Control batches have a single record indicating whether a transaction
                         # was aborted or committed. These are not returned to the consumer.
                         if batch.is_control_batch:
                             self.next_fetch_offset = batch.next_offset
-                            batch = records.next_batch()
+                            batch = records.next_batch(
+                                max_decompressed_bytes=self.max_decompressed_bytes,
+                                max_records=self.max_records_per_batch)
                             continue
 
-                    for record in batch:
+                    try:
+                        record_iter = iter(batch)
+                    except Errors.DecompressionLimitError:
+                        # Do not let a failed batch consume the position of
+                        # later batches in the same fetch response.
+                        self.next_fetch_offset = batch.next_offset
+                        raise
+
+                    for record in record_iter:
                         if self.check_crcs and not record.validate_crc():
-                            raise Errors.CorruptRecordError(
+                            raise Errors.RecordCRCError(
                                     "Record for partition %s at offset %s failed crc check" % (
                                         self.topic_partition, record.offset))
                         key_size = len(record.key) if record.key is not None else -1
@@ -1726,7 +1779,9 @@ class Fetcher:
                             record.timestamp_type, key, value, record.headers, record.checksum,
                             key_size, value_size, header_size)
 
-                    batch = records.next_batch()
+                    batch = records.next_batch(
+                        max_decompressed_bytes=self.max_decompressed_bytes,
+                        max_records=self.max_records_per_batch)
                 else:
                     # Message format v2 preserves the last offset in a batch even if the last record is removed
                     # through compaction. By using the next offset computed from the last offset in the batch,

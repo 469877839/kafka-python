@@ -53,6 +53,16 @@ from kafka.codec import (
 )
 import kafka.codec as codecs
 from kafka.errors import CorruptRecordError, UnsupportedCodecError
+from kafka.errors import (
+    DecompressionBytesLimitError,
+    RecordCountLimitError,
+    UnsupportedRecordLimitsError,
+)
+from kafka.record.default_records import (
+    _DECOMPRESSED_BYTES_LIMIT_ALIASES,
+    _RECORD_COUNT_LIMIT_ALIASES,
+    _resolve_limit,
+)
 
 
 class LegacyRecordBase:
@@ -133,9 +143,20 @@ class LegacyRecordBase:
 class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
 
     __slots__ = ("_buffer", "_magic", "_offset", "_length", "_crc", "_timestamp",
-                 "_attributes", "_decompressed")
+                 "_attributes", "_decompressed", "_max_decompressed_bytes",
+                 "_max_records", "_decompressed_bytes")
 
-    def __init__(self, buffer, magic):
+    def __init__(self, buffer, magic, max_decompressed_bytes=None,
+                 max_records=None, **kwargs):
+        self._max_decompressed_bytes = _resolve_limit(
+            "max_decompressed_bytes", max_decompressed_bytes,
+            _DECOMPRESSED_BYTES_LIMIT_ALIASES, kwargs)
+        self._max_records = _resolve_limit(
+            "max_records", max_records, _RECORD_COUNT_LIMIT_ALIASES, kwargs)
+        if kwargs:
+            raise TypeError(
+                "Unexpected keyword arguments: {}".format(
+                    ", ".join(sorted(kwargs))))
         self._buffer = memoryview(buffer)
         self._magic = magic
 
@@ -149,6 +170,7 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
         self._timestamp = timestamp
         self._attributes = attrs
         self._decompressed = False
+        self._decompressed_bytes = None
 
     @property
     def base_offset(self):
@@ -202,14 +224,42 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
         compression_type = self.compression_type
         self._assert_has_codec(compression_type)
         if compression_type == self.CODEC_GZIP:
-            uncompressed = gzip_decode(data)
+            if self._max_decompressed_bytes is None:
+                uncompressed = gzip_decode(data)
+            else:
+                try:
+                    uncompressed = gzip_decode(
+                        data, max_output_size=self._max_decompressed_bytes)
+                except DecompressionBytesLimitError as err:
+                    self._decompressed_bytes = err.actual
+                    raise
+                if len(uncompressed) > self._max_decompressed_bytes:
+                    self._decompressed_bytes = len(uncompressed)
+                    raise DecompressionBytesLimitError(
+                        "Decompressed record batch exceeds "
+                        "max_decompressed_bytes ({} > {})".format(
+                            len(uncompressed),
+                            self._max_decompressed_bytes),
+                        limit=self._max_decompressed_bytes,
+                        actual=len(uncompressed), kind="bytes")
         elif compression_type == self.CODEC_SNAPPY:
+            if self._max_decompressed_bytes is not None:
+                raise UnsupportedRecordLimitsError(
+                    "Decompressed byte limits are not supported for the "
+                    "snappy codec; only uncompressed and gzip record "
+                    "batches support incremental limits")
             uncompressed = snappy_decode(data.tobytes())
         elif compression_type == self.CODEC_LZ4:
+            if self._max_decompressed_bytes is not None:
+                raise UnsupportedRecordLimitsError(
+                    "Decompressed byte limits are not supported for the "
+                    "lz4 codec; only uncompressed and gzip record batches "
+                    "support incremental limits")
             if self._magic == 0:
                 uncompressed = lz4_decode_old_kafka(data.tobytes())
             else:
                 uncompressed = lz4_decode(data.tobytes())
+        self._decompressed_bytes = len(uncompressed)
         return uncompressed  # pylint: disable=E0606
 
     def _read_header(self, pos):
@@ -271,6 +321,14 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
             # If relative offset is used, we need to decompress the entire
             # message first to compute the absolute offset.
             headers = self._read_all_headers()
+            if (self._max_records is not None
+                    and len(headers) > self._max_records):
+                raise RecordCountLimitError(
+                    "Record batch contains {} records, which exceeds "
+                    "max_records ({})".format(
+                        len(headers), self._max_records),
+                    limit=self._max_records, actual=len(headers),
+                    kind="records")
             if self._magic > 0:
                 msg_header, _ = headers[-1]
                 absolute_base_offset = self._offset - msg_header[0]
@@ -299,6 +357,22 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
                     self._magic, offset, timestamp, timestamp_type,
                     key, value, crc, crc_bytes)
         else:
+            if (self._max_records is not None and self._max_records < 1):
+                raise RecordCountLimitError(
+                    "Record batch contains 1 record, which exceeds "
+                    "max_records ({})".format(self._max_records),
+                    limit=self._max_records, actual=1, kind="records")
+            payload_size = len(self._buffer) - self.LOG_OVERHEAD
+            if (self._max_decompressed_bytes is not None
+                    and payload_size > self._max_decompressed_bytes):
+                self._decompressed_bytes = payload_size
+                raise DecompressionBytesLimitError(
+                    "Uncompressed record payload exceeds "
+                    "max_decompressed_bytes ({} > {})".format(
+                        payload_size, self._max_decompressed_bytes),
+                    limit=self._max_decompressed_bytes,
+                    actual=payload_size, kind="bytes")
+            self._decompressed_bytes = payload_size
             key, value = self._read_key_value(key_offset)
             crc_bytes = self._crc_bytes(0, len(self._buffer) - self.LOG_OVERHEAD)
             yield LegacyRecord(
