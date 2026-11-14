@@ -1101,10 +1101,12 @@ class Fetcher:
             TopicAuthorizationFailedError: if any topic returned an auth error.
         """
         by_topic = collections.defaultdict(list)
+        requested_leader_epochs = {}
         for tp, position in partitions_to_positions.items():
             current_leader_epoch = self._manager.cluster.leader_epoch_for_partition(tp)
             if current_leader_epoch is None or current_leader_epoch < 0:
                 current_leader_epoch = -1
+            requested_leader_epochs[tp] = current_leader_epoch
             by_topic[tp.topic].append(_OffsetForLeaderPartition(
                 partition=tp.partition,
                 current_leader_epoch=current_leader_epoch,
@@ -1118,9 +1120,11 @@ class Fetcher:
 
         log.debug("Sending OffsetForLeaderEpochRequest %s to broker %s", request, node_id)
         response = await self._manager.send(request, node_id=node_id)
-        return self._handle_offset_for_leader_epoch_response(response, partitions_to_positions)
+        return self._handle_offset_for_leader_epoch_response(
+            response, partitions_to_positions, requested_leader_epochs)
 
-    def _handle_offset_for_leader_epoch_response(self, response, requested_positions):
+    def _handle_offset_for_leader_epoch_response(
+            self, response, requested_positions, requested_leader_epochs=None):
         """Parse an OffsetForLeaderEpoch response.
 
         Side effects: calls ``complete_validation`` / ``validation_failed``
@@ -1156,6 +1160,29 @@ class Fetcher:
                     if current is None or current != requested:
                         log.debug("Skipping validation completion for %s: position "
                                   "changed since request was sent", tp)
+                        continue
+
+                    # A leader election may have advanced the cluster epoch while
+                    # this request was in flight. The broker's answer only
+                    # validates our position against the leader that was current
+                    # when the request was sent; a newer leader's log could be
+                    # shorter. Completing (or truncating) on the stale answer
+                    # would either reopen fetching against an unvalidated leader
+                    # or seek to a divergence point the new leader never
+                    # confirmed. Drop the answer and re-validate against the
+                    # current epoch.
+                    epoch_now = self._manager.cluster.leader_epoch_for_partition(tp)
+                    requested_epoch = (requested_leader_epochs or {}).get(tp, -1)
+                    if (epoch_now is not None
+                            and requested_epoch >= 0
+                            and epoch_now > requested_epoch):
+                        log.debug(
+                            "Discarding stale OffsetForLeaderEpoch response for "
+                            "%s: leader epoch advanced %s -> %s while request "
+                            "was in flight; re-validating",
+                            tp, requested_epoch, epoch_now)
+                        self._manager.cluster.request_update()
+                        retry.add(tp)
                         continue
 
                     has_reset_policy = self._subscriptions.has_default_offset_reset_policy()
